@@ -468,6 +468,15 @@ for source_filepath in source_files:
         inlier_ref_pts_clip, inlier_src_pts_clip,
         tps_max_control_points, clip_w, clip_h, rng
     )
+
+    # Deduplicate: SIFT keypoints from different spectral channels can land at
+    # the same or nearly-same pixel, causing the TPS kernel matrix to be singular.
+    # Round to the nearest 0.5 px in clip space and keep one representative per site.
+    _rounded = (tps_ref_pts_clip / 0.5).round().astype(np.int64)
+    _, _unique_idx = np.unique(_rounded, axis=0, return_index=True)
+    tps_ref_pts_clip = tps_ref_pts_clip[_unique_idx]
+    tps_src_pts_clip = tps_src_pts_clip[_unique_idx]
+
     n_tps = len(tps_ref_pts_clip)
     print(f"  TPS control points: {n_tps} "
           f"(from {inlier_count} RANSAC inliers, max={tps_max_control_points})")
@@ -483,56 +492,70 @@ for source_filepath in source_files:
     disp_x = tps_src_pts_full[:, 0] - tps_ref_pts_full[:, 0]
     disp_y = tps_src_pts_full[:, 1] - tps_ref_pts_full[:, 1]
 
-    # --- Fit thin-plate-spline RBF in full-image coordinate space ---
-    # smoothing=0 forces exact interpolation through all control points.
+    # --- Fit thin-plate-spline RBF ---
+    # Coordinates are normalised to [0, 1] before fitting: the TPS kernel
+    # phi(r) = r² log(r) varies over many orders of magnitude when r spans
+    # thousands of pixels, leading to an ill-conditioned kernel matrix.
+    # A small smoothing (1e-3 in normalised space ≈ sub-pixel in image space)
+    # is added as a safety regulariser; it has negligible effect on accuracy.
+    ref_h = working_reference.shape[1]
+    ref_w = working_reference.shape[2]
+    _coord_scale = np.array([[float(ref_w), float(ref_h)]])
+    tps_ref_pts_norm = tps_ref_pts_full / _coord_scale
+
     print(f"  Fitting TPS RBF ({n_tps} control points)...")
     rbf_dx = RBFInterpolator(
-        tps_ref_pts_full, disp_x, kernel='thin_plate_spline', smoothing=0
+        tps_ref_pts_norm, disp_x, kernel='thin_plate_spline', smoothing=1e-3
     )
     rbf_dy = RBFInterpolator(
-        tps_ref_pts_full, disp_y, kernel='thin_plate_spline', smoothing=0
+        tps_ref_pts_norm, disp_y, kernel='thin_plate_spline', smoothing=1e-3
     )
 
     # --- Evaluate on a coarse grid covering the full reference image ---
-    ref_h = working_reference.shape[1]
-    ref_w = working_reference.shape[2]
     nc_x = min(tps_coarse_grid_size, ref_w)
     nc_y = min(tps_coarse_grid_size, ref_h)
     c_xs = np.linspace(0, ref_w - 1, nc_x)
     c_ys = np.linspace(0, ref_h - 1, nc_y)
     c_xx, c_yy = np.meshgrid(c_xs, c_ys)
     coarse_pts = np.column_stack([c_xx.ravel(), c_yy.ravel()])
+    coarse_pts_norm = coarse_pts / _coord_scale
 
     print(f"  Evaluating TPS on {nc_x}×{nc_y} coarse grid...")
-    c_ddx = rbf_dx(coarse_pts).reshape(nc_y, nc_x).astype(np.float32)
-    c_ddy = rbf_dy(coarse_pts).reshape(nc_y, nc_x).astype(np.float32)
+    c_ddx = rbf_dx(coarse_pts_norm).reshape(nc_y, nc_x).astype(np.float32)
+    c_ddy = rbf_dy(coarse_pts_norm).reshape(nc_y, nc_x).astype(np.float32)
 
     # --- Upsample displacement field to full reference image resolution ---
     full_ddx = cv2.resize(c_ddx, (ref_w, ref_h), interpolation=cv2.INTER_LINEAR)
     full_ddy = cv2.resize(c_ddy, (ref_w, ref_h), interpolation=cv2.INTER_LINEAR)
 
     # --- Average displacement over the overlap (clip) region ---
-    # Computed in the clip region where control points exist and the field
-    # is well-constrained by data, rather than in extrapolated margins.
+    # full_ddx / full_ddy are in full-image coordinate space: each value is
+    # (src_full_x - ref_full_x).  To express the displacement in clip space
+    # (i.e. the net geolocation shift, comparable to ground-truth dx_px),
+    # add back the clip-origin offset:
+    #   disp_clip = disp_full + (ref_col_off - src_col_off)
+    # This removes the large constant contribution from mismatched clip origins
+    # and leaves only the true inter-image geolocation difference.
     _r_s = ref_row_off
     _r_e = min(ref_row_off + clip_h, ref_h)
     _c_s = ref_col_off
     _c_e = min(ref_col_off + clip_w, ref_w)
-    metrics['avg_dx_px'] = float(np.mean(full_ddx[_r_s:_r_e, _c_s:_c_e]))
-    metrics['avg_dy_px'] = float(np.mean(full_ddy[_r_s:_r_e, _c_s:_c_e]))
+    metrics['avg_dx_px'] = (float(np.mean(full_ddx[_r_s:_r_e, _c_s:_c_e]))
+                            + float(ref_col_off - src_col_off))
+    metrics['avg_dy_px'] = (float(np.mean(full_ddy[_r_s:_r_e, _c_s:_c_e]))
+                            + float(ref_row_off - src_row_off))
     print(f"  Average displacement in overlap — "
           f"dx: {metrics['avg_dx_px']:.3f} px, dy: {metrics['avg_dy_px']:.3f} px")
 
     # --- Build cv2.remap lookup tables (source full-image coordinates) ---
-    # For each reference full-image pixel (col_f, row_f):
-    #   src_full_col = col_f + full_ddx[row_f, col_f]
-    #   src_full_row = row_f + full_ddy[row_f, col_f]
-    base_xx, base_yy = np.meshgrid(
-        np.arange(ref_w, dtype=np.float32),
-        np.arange(ref_h, dtype=np.float32)
-    )
-    map_x = base_xx + full_ddx  # source full-image column for each reference pixel
-    map_y = base_yy + full_ddy  # source full-image row for each reference pixel
+    # Build map_x / map_y in-place from full_ddx / full_ddy to avoid allocating
+    # two additional (ref_h × ref_w) float32 arrays (each ~60 MB for 4K imagery).
+    # full_ddx / full_ddy are consumed here and no longer needed afterwards.
+    full_ddx += np.arange(ref_w, dtype=np.float32)           # add col index per column
+    full_ddy += np.arange(ref_h, dtype=np.float32).reshape(-1, 1)  # add row index per row
+    map_x = full_ddx  # source full-image column for each reference pixel
+    map_y = full_ddy  # source full-image row for each reference pixel
+    del c_ddx, c_ddy, coarse_pts, coarse_pts_norm            # free coarse intermediates
 
     # Out-of-bounds mask: reference pixels whose mapped source position falls
     # outside the source image extent (will be set to NaN in the output).
@@ -602,6 +625,17 @@ for source_filepath in source_files:
         alignment_metrics_filepath, source_filename, reference_filename, inlier_count,
         len(all_src_pts), total_raw_matches, metrics
     )
+
+    # --- Early memory release before plots ---
+    # source_warped, map_x/map_y and the clip DataArrays are no longer needed.
+    # Free them now so their memory is available for matplotlib during plotting.
+    # src_nd, ref_nd, and the inlier point arrays are still required by the plots.
+    del (_warped_clip, source_warped, map_x, map_y, out_of_bounds,
+         src_clip, ref_clip, src_bands, ref_bands,
+         tps_ref_pts_clip, tps_src_pts_clip, tps_ref_pts_full, tps_src_pts_full,
+         disp_x, disp_y, rbf_dx, rbf_dy,
+         inlier_ref_pts_clip, inlier_src_pts_clip)
+    gc.collect()
 
     # --- Diagnostic plot: falsecolor index comparison in the overlap region ---
     display_channels = ['ndvi', 'nd_gr', 'nd_bnir']
@@ -718,5 +752,9 @@ for source_filepath in source_files:
         dpi=150
     )
     plt.close(fig3)
+
+    # --- Final memory cleanup before next iteration ---
+    del source_image, src_nd, ref_nd, all_src_pts, all_ref_pts, inlier_src, inlier_ref
+    gc.collect()
 
 print("\nDone.")
