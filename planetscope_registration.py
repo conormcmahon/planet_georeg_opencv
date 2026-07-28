@@ -147,13 +147,18 @@ def get_clip_offset(full_image, clip_image):
 def adjust_homography_for_offsets(M_3x3, src_col, src_row, ref_col, ref_row):
     """
     Convert a 3x3 affine-as-homography estimated on clipped images so that it maps
-    full-source pixel coords to full-reference pixel coords.
+    full-reference pixel coords to full-source pixel coords (ref_full → src_full).
 
-        M_full = T_ref_offset  @  M_clip  @  T_src_offset_inv
+    M_clip maps ref_clip → src_clip.  To lift that into full-image space:
+      1. T_ref_inv: ref_full → ref_clip  (subtract the reference clip origin)
+      2. M_clip:    ref_clip → src_clip
+      3. T_src:     src_clip → src_full  (add the source clip origin)
+
+        M_full = T_src  @  M_clip  @  T_ref_inv
     """
-    T_src_inv = np.float32([[1, 0, -src_col], [0, 1, -src_row], [0, 0, 1]])
-    T_ref     = np.float32([[1, 0,  ref_col], [0, 1,  ref_row], [0, 0, 1]])
-    return T_ref @ M_3x3 @ T_src_inv
+    T_ref_inv = np.float32([[1, 0, -ref_col], [0, 1, -ref_row], [0, 0, 1]])
+    T_src     = np.float32([[1, 0,  src_col], [0, 1,  src_row], [0, 0, 1]])
+    return T_src @ M_3x3 @ T_ref_inv
 
 
 _METRIC_KEYS = [
@@ -449,9 +454,16 @@ for source_filepath in source_files:
     # warpPerspective fills out-of-bounds with 0; warping a ones-array then thresholding
     # identifies those regions without relying on borderValue NaN support.
     src_h_full, src_w_full = source_image.shape[1], source_image.shape[2]
+    # M_full maps reference pixel coords → source pixel coords (ref → src).
+    # WARP_INVERSE_MAP tells warpPerspective to use M directly as the dst→src
+    # lookup (output(p_ref) = source(M_full(p_ref))) rather than inverting it,
+    # which would incorrectly apply the src→ref direction.
+    _WARP_FLAGS_NN  = cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP
+    _WARP_FLAGS_LIN = cv2.INTER_LINEAR  | cv2.WARP_INVERSE_MAP
+
     coverage = cv2.warpPerspective(
         np.ones((src_h_full, src_w_full), dtype=np.float32),
-        M_full, (ref_w, ref_h), flags=cv2.INTER_LINEAR
+        M_full, (ref_w, ref_h), flags=_WARP_FLAGS_LIN
     )
     out_of_bounds = coverage < 0.5
 
@@ -462,11 +474,11 @@ for source_filepath in source_files:
         # Warp the source NaN mask so we can propagate masked pixels to the output.
         src_nan = np.isnan(band_data)
         warped_nan = cv2.warpPerspective(
-            src_nan.astype(np.float32), M_full, (ref_w, ref_h), flags=cv2.INTER_NEAREST
+            src_nan.astype(np.float32), M_full, (ref_w, ref_h), flags=_WARP_FLAGS_NN
         ) > 0.5
 
         warped_band = cv2.warpPerspective(
-            np.where(src_nan, 0.0, band_data), M_full, (ref_w, ref_h), flags=cv2.INTER_LINEAR
+            np.where(src_nan, 0.0, band_data), M_full, (ref_w, ref_h), flags=_WARP_FLAGS_LIN
         )
         warped_band[out_of_bounds | warped_nan] = np.nan
         source_warped.values[band] = warped_band
