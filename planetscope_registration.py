@@ -129,13 +129,13 @@ def adjust_homography_for_offsets(M_3x3, src_col, src_row, ref_col, ref_row):
     return T_ref @ M_3x3 @ T_src_inv
 
 
-def write_alignment_metrics(filepath, source_filename, num_ransac, num_good, num_raw, M_mat):
+def write_alignment_metrics(filepath, source_filename, target_filename, num_ransac, num_good, num_raw, M_mat):
     """Append one row of registration quality metrics to the CSV log."""
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     if not os.path.exists(filepath):
         with open(filepath, 'w') as f:
             f.write(
-                "source_filename,num_ransac_inliers,num_good_matches,num_raw_matches,"
+                "source_filename,target_filename,num_ransac_inliers,num_good_matches,num_raw_matches,"
                 "M_0,M_1,M_2,M_3,M_4,M_5,M_6,M_7,M_8\n"
             )
     with open(filepath, 'a') as f:
@@ -143,7 +143,7 @@ def write_alignment_metrics(filepath, source_filename, num_ransac, num_good, num
             m_vals = ','.join(str(v) for v in M_mat.flatten())
         else:
             m_vals = ','.join(['0'] * 9)
-        f.write(f"{source_filename},{num_ransac},{num_good},{num_raw},{m_vals}\n")
+        f.write(f"{source_filename},{target_filename},{num_ransac},{num_good},{num_raw},{m_vals}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +184,7 @@ for source_filepath in source_files:
     gc.collect()
 
     source_filename = os.path.basename(source_filepath)
+    reference_filename = os.path.basename(reference_filepath)
     print("=" * 70)
     print(f"Processing: {source_filename}")
 
@@ -205,7 +206,7 @@ for source_filepath in source_files:
     if overlap is None:
         print("  No geographic overlap between source and reference. Skipping.")
         write_alignment_metrics(
-            alignment_metrics_filepath, source_filename, 0, 0, 0, None
+            alignment_metrics_filepath, source_filename, reference_filename, 0, 0, 0, None
         )
         continue
 
@@ -223,7 +224,7 @@ for source_filepath in source_files:
     if min(src_valid, ref_valid) < min_pixel_count:
         print("  Too few valid pixels in overlap. Skipping.")
         write_alignment_metrics(
-            alignment_metrics_filepath, source_filename, 0, 0, 0, None
+            alignment_metrics_filepath, source_filename, reference_filename, 0, 0, 0, None
         )
         continue
 
@@ -298,7 +299,7 @@ for source_filepath in source_files:
     if len(all_src_pts) < 4:
         print("  Not enough good matches for RANSAC. Skipping.")
         write_alignment_metrics(
-            alignment_metrics_filepath, source_filename, 0, len(all_src_pts),
+            alignment_metrics_filepath, source_filename, reference_filename, 0, len(all_src_pts),
             total_raw_matches, None
         )
         continue
@@ -319,7 +320,7 @@ for source_filepath in source_files:
     if M_part is None:
         print("  RANSAC failed to produce a valid affine transform. Skipping.")
         write_alignment_metrics(
-            alignment_metrics_filepath, source_filename, 0, len(all_src_pts),
+            alignment_metrics_filepath, source_filename, reference_filename, 0, len(all_src_pts),
             total_raw_matches, None
         )
         continue
@@ -334,13 +335,13 @@ for source_filepath in source_files:
     if inlier_count < 4:
         print("  Too few RANSAC inliers. Skipping.")
         write_alignment_metrics(
-            alignment_metrics_filepath, source_filename, inlier_count,
+            alignment_metrics_filepath, source_filename, reference_filename, inlier_count,
             len(all_src_pts), total_raw_matches, M
         )
         continue
 
     write_alignment_metrics(
-        alignment_metrics_filepath, source_filename, inlier_count,
+        alignment_metrics_filepath, source_filename, reference_filename, inlier_count,
         len(all_src_pts), total_raw_matches, M
     )
     print(f"  Affine transform (clip space):\n{M}")
@@ -363,7 +364,7 @@ for source_filepath in source_files:
     ref_w = working_reference.shape[2]
 
     source_warped = xr.DataArray(
-        np.zeros((source_image.shape[0], ref_h, ref_w), dtype=np.float32),
+        np.full((source_image.shape[0], ref_h, ref_w), np.nan, dtype=np.float32),
         coords={
             "band": np.arange(1, source_image.shape[0] + 1),
             "y": working_reference.y,
@@ -375,14 +376,30 @@ for source_filepath in source_files:
     source_warped.rio.set_spatial_dims(x_dim="x", y_dim="y", inplace=True)
     source_warped.attrs.update(source_image.attrs)
 
+    # Build a coverage mask once: pixels outside the warped source footprint get NaN.
+    # warpPerspective fills out-of-bounds with 0; warping a ones-array then thresholding
+    # identifies those regions without relying on borderValue NaN support.
+    src_h_full, src_w_full = source_image.shape[1], source_image.shape[2]
+    coverage = cv2.warpPerspective(
+        np.ones((src_h_full, src_w_full), dtype=np.float32),
+        M_full, (ref_w, ref_h), flags=cv2.INTER_LINEAR
+    )
+    out_of_bounds = coverage < 0.5
+
     for band in range(source_image.shape[0]):
         print(f"  Warping band {band + 1}/{source_image.shape[0]}")
+        band_data = source_image.isel(band=band).values.astype(np.float32)
+
+        # Warp the source NaN mask so we can propagate masked pixels to the output.
+        src_nan = np.isnan(band_data)
+        warped_nan = cv2.warpPerspective(
+            src_nan.astype(np.float32), M_full, (ref_w, ref_h), flags=cv2.INTER_NEAREST
+        ) > 0.5
+
         warped_band = cv2.warpPerspective(
-            source_image.isel(band=band).values.astype(np.float32),
-            M_full,
-            (ref_w, ref_h),
-            flags=cv2.INTER_LINEAR
+            np.where(src_nan, 0.0, band_data), M_full, (ref_w, ref_h), flags=cv2.INTER_LINEAR
         )
+        warped_band[out_of_bounds | warped_nan] = np.nan
         source_warped.values[band] = warped_band
 
     if 'long_name' in source_image.attrs:
@@ -449,5 +466,73 @@ for source_filepath in source_files:
         )
     )
     plt.close(fig2)
+
+    # --- Diagnostic plot: correspondence lines between inlier matched pairs ---
+    # Downsample both clips to a manageable display resolution before concatenating,
+    # then draw green lines connecting each inlier pair across the two panels.
+    max_display_h = 600
+    src_h_clip, src_w_clip = src_ndvi_u8.shape
+    ref_h_clip, ref_w_clip = ref_ndvi_u8.shape
+    scale = min(1.0, max_display_h / max(src_h_clip, ref_h_clip))
+
+    def resize_display(arr, s):
+        return cv2.resize(arr, (max(1, int(arr.shape[1] * s)), max(1, int(arr.shape[0] * s))),
+                          interpolation=cv2.INTER_AREA)
+
+    src_disp = resize_display(src_ndvi_u8, scale)
+    ref_disp = resize_display(ref_ndvi_u8, scale)
+
+    disp_src_h, disp_src_w = src_disp.shape
+    disp_ref_h, disp_ref_w = ref_disp.shape
+    canvas_h = max(disp_src_h, disp_ref_h)
+    canvas_w = disp_src_w + disp_ref_w
+
+    canvas = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
+    canvas[:disp_src_h, :disp_src_w] = src_disp
+    canvas[:disp_ref_h, disp_src_w:disp_src_w + disp_ref_w] = ref_disp
+
+    # Draw a random subset of lines to avoid overplotting
+    max_lines = 300
+    rng = np.random.default_rng(seed=0)
+    if len(inlier_src) > max_lines:
+        idx = rng.choice(len(inlier_src), max_lines, replace=False)
+        plot_src_pts = inlier_src[idx]
+        plot_ref_pts = inlier_ref[idx]
+    else:
+        plot_src_pts = inlier_src
+        plot_ref_pts = inlier_ref
+
+    fig3, ax5 = plt.subplots(figsize=(18, 7))
+    ax5.set_title(
+        f'Inlier Correspondences — {inlier_count} total'
+        f' ({len(plot_src_pts)} shown)\n'
+        f'Source: {source_filename}  |  Reference: {reference_filename}'
+    )
+    ax5.imshow(canvas, cmap='gray', vmin=0, vmax=255)
+    ax5.axvline(x=disp_src_w, color='white', linewidth=1, linestyle='--')
+
+    for sp, rp in zip(plot_src_pts, plot_ref_pts):
+        ax5.plot(
+            [sp[0] * scale, rp[0] * scale + disp_src_w],
+            [sp[1] * scale, rp[1] * scale],
+            color='lime', linewidth=0.5, alpha=0.6
+        )
+    if len(plot_src_pts):
+        ax5.scatter(plot_src_pts[:, 0] * scale, plot_src_pts[:, 1] * scale,
+                    s=6, c='red', zorder=5, linewidths=0)
+        ax5.scatter(plot_ref_pts[:, 0] * scale + disp_src_w, plot_ref_pts[:, 1] * scale,
+                    s=6, c='cyan', zorder=5, linewidths=0)
+
+    ax5.set_xlabel('← Source NDVI clip          Reference NDVI clip →')
+    ax5.axis('off')
+    fig3.tight_layout()
+    fig3.savefig(
+        os.path.join(
+            output_directory, "output_plots",
+            source_filename.replace('.tif', '_correspondences.png')
+        ),
+        dpi=150
+    )
+    plt.close(fig3)
 
 print("\nDone.")
