@@ -87,6 +87,33 @@ def to_uint8(arr):
     ).astype(np.uint8)
 
 
+def compute_band_metrics(src_da, ref_da, src_band_idx, ref_band_idx):
+    """
+    Compute per-band Pearson R² and RMSE for blue/green/red/NIR.
+
+    Both DataArrays must be on the same pixel grid. Valid (non-NaN) pixels
+    in both arrays are compared. R² is the square of the Pearson correlation
+    coefficient, which measures structural agreement independent of any
+    systematic radiometric offset between the two images.
+
+    Returns two dicts keyed by band name: r2, rmse.
+    """
+    r2, rmse = {}, {}
+    for name in ('blue', 'green', 'red', 'nir'):
+        s = src_da.isel(band=src_band_idx[name]).values.astype(np.float32).ravel()
+        r = ref_da.isel(band=ref_band_idx[name]).values.astype(np.float32).ravel()
+        valid = ~(np.isnan(s) | np.isnan(r))
+        if valid.sum() < 2:
+            r2[name] = np.nan
+            rmse[name] = np.nan
+            continue
+        a, b = s[valid], r[valid]
+        rmse[name] = float(np.sqrt(np.mean((a - b) ** 2)))
+        corr = np.corrcoef(a, b)[0, 1]
+        r2[name] = float(corr ** 2) if np.isfinite(corr) else np.nan
+    return r2, rmse
+
+
 def find_overlap(image1, image2):
     """
     Return (left, bottom, right, top) geographic bounding box of the overlap
@@ -129,21 +156,39 @@ def adjust_homography_for_offsets(M_3x3, src_col, src_row, ref_col, ref_row):
     return T_ref @ M_3x3 @ T_src_inv
 
 
-def write_alignment_metrics(filepath, source_filename, target_filename, num_ransac, num_good, num_raw, M_mat):
+_METRIC_KEYS = [
+    'r2_blue_before',   'r2_green_before',   'r2_red_before',   'r2_nir_before',
+    'r2_blue_after',    'r2_green_after',     'r2_red_after',    'r2_nir_after',
+    'rmse_blue_before', 'rmse_green_before',  'rmse_red_before', 'rmse_nir_before',
+    'rmse_blue_after',  'rmse_green_after',   'rmse_red_after',  'rmse_nir_after',
+    'mean_kp_dist_before', 'mean_kp_dist_after',
+]
+
+
+def _blank_metrics():
+    return {k: np.nan for k in _METRIC_KEYS}
+
+
+def write_alignment_metrics(filepath, source_filename, target_filename,
+                             num_ransac, num_good, num_raw, M_mat, metrics=None):
     """Append one row of registration quality metrics to the CSV log."""
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     if not os.path.exists(filepath):
         with open(filepath, 'w') as f:
             f.write(
                 "source_filename,target_filename,num_ransac_inliers,num_good_matches,num_raw_matches,"
-                "M_0,M_1,M_2,M_3,M_4,M_5,M_6,M_7,M_8\n"
+                "M_0,M_1,M_2,M_3,M_4,M_5,M_6,M_7,M_8,"
+                + ','.join(_METRIC_KEYS) + '\n'
             )
+    if metrics is None:
+        metrics = _blank_metrics()
     with open(filepath, 'a') as f:
         if M_mat is not None:
             m_vals = ','.join(str(v) for v in M_mat.flatten())
         else:
             m_vals = ','.join(['0'] * 9)
-        f.write(f"{source_filename},{target_filename},{num_ransac},{num_good},{num_raw},{m_vals}\n")
+        extra_vals = ','.join(str(metrics.get(k, np.nan)) for k in _METRIC_KEYS)
+        f.write(f"{source_filename},{target_filename},{num_ransac},{num_good},{num_raw},{m_vals},{extra_vals}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +230,7 @@ for source_filepath in source_files:
 
     source_filename = os.path.basename(source_filepath)
     reference_filename = os.path.basename(reference_filepath)
+    metrics = _blank_metrics()
     print("=" * 70)
     print(f"Processing: {source_filename}")
 
@@ -206,7 +252,7 @@ for source_filepath in source_files:
     if overlap is None:
         print("  No geographic overlap between source and reference. Skipping.")
         write_alignment_metrics(
-            alignment_metrics_filepath, source_filename, reference_filename, 0, 0, 0, None
+            alignment_metrics_filepath, source_filename, reference_filename, 0, 0, 0, None, metrics
         )
         continue
 
@@ -224,9 +270,18 @@ for source_filepath in source_files:
     if min(src_valid, ref_valid) < min_pixel_count:
         print("  Too few valid pixels in overlap. Skipping.")
         write_alignment_metrics(
-            alignment_metrics_filepath, source_filename, reference_filename, 0, 0, 0, None
+            alignment_metrics_filepath, source_filename, reference_filename, 0, 0, 0, None, metrics
         )
         continue
+
+    # --- Before-alignment band metrics (clip pixel comparison in overlap region) ---
+    # src_clip and ref_clip cover the same geographic box; at 1:1 resolution they
+    # share the same pixel grid, so pixel-wise comparison is a valid pre-registration baseline.
+    if src_clip.shape[1:] == ref_clip.shape[1:]:
+        _r2b, _rmseb = compute_band_metrics(src_clip, ref_clip, src_band_indices, ref_band_indices)
+        for _bn in ('blue', 'green', 'red', 'nir'):
+            metrics[f'r2_{_bn}_before']   = _r2b[_bn]
+            metrics[f'rmse_{_bn}_before'] = _rmseb[_bn]
 
     # --- Extract common bands and compute all six ND indices ---
     src_bands = extract_bgrnir(src_clip, src_band_indices)
@@ -300,7 +355,7 @@ for source_filepath in source_files:
         print("  Not enough good matches for RANSAC. Skipping.")
         write_alignment_metrics(
             alignment_metrics_filepath, source_filename, reference_filename, 0, len(all_src_pts),
-            total_raw_matches, None
+            total_raw_matches, None, metrics
         )
         continue
 
@@ -321,7 +376,7 @@ for source_filepath in source_files:
         print("  RANSAC failed to produce a valid affine transform. Skipping.")
         write_alignment_metrics(
             alignment_metrics_filepath, source_filename, reference_filename, 0, len(all_src_pts),
-            total_raw_matches, None
+            total_raw_matches, None, metrics
         )
         continue
 
@@ -332,18 +387,32 @@ for source_filepath in source_files:
     inlier_count = int(np.sum(mask)) if mask is not None else 0
     print(f"  RANSAC inliers: {inlier_count} / {len(all_src_pts)}")
 
+    # --- Keypoint alignment distances (before and after applying the transform) ---
+    # Before: mean scaled distance between raw matched keypoint positions in each clip.
+    # After:  mean reprojection error when M_part is applied to reference keypoints.
+    _inlier_bool = (mask.ravel() == 1) if mask is not None else np.zeros(len(all_src_pts), bool)
+    if _inlier_bool.sum() >= 1:
+        _isrc = np.float32(all_src_pts)[_inlier_bool]
+        _iref = np.float32(all_ref_pts)[_inlier_bool]
+        _diffs_before = _isrc - _iref * np.array([[scale_x, scale_y]])
+        metrics['mean_kp_dist_before'] = float(
+            np.mean(np.sqrt(np.sum(_diffs_before ** 2, axis=1)))
+        )
+        _ref_h = np.c_[_iref, np.ones(len(_iref))]   # Nx3 homogeneous ref coords
+        _pred_src = (M_part @ _ref_h.T).T             # Nx2 predicted source coords
+        _diffs_after = _isrc - _pred_src
+        metrics['mean_kp_dist_after'] = float(
+            np.mean(np.sqrt(np.sum(_diffs_after ** 2, axis=1)))
+        )
+
     if inlier_count < 4:
         print("  Too few RANSAC inliers. Skipping.")
         write_alignment_metrics(
             alignment_metrics_filepath, source_filename, reference_filename, inlier_count,
-            len(all_src_pts), total_raw_matches, M
+            len(all_src_pts), total_raw_matches, M, metrics
         )
         continue
 
-    write_alignment_metrics(
-        alignment_metrics_filepath, source_filename, reference_filename, inlier_count,
-        len(all_src_pts), total_raw_matches, M
-    )
     print(f"  Affine transform (clip space):\n{M}")
 
     # --- Adjust homography from clip pixel space to full-image pixel space ---
@@ -411,6 +480,20 @@ for source_filepath in source_files:
     )
     source_warped.rio.to_raster(output_filepath)
     print(f"  Saved registered image: {output_filepath}")
+
+    # --- After-alignment band metrics ---
+    # source_warped is on the reference pixel grid, so clip_box gives exact alignment.
+    _warped_clip = source_warped.rio.clip_box(minx=left, miny=bottom, maxx=right, maxy=top)
+    if _warped_clip.shape[1:] == ref_clip.shape[1:]:
+        _r2a, _rmsea = compute_band_metrics(_warped_clip, ref_clip, src_band_indices, ref_band_indices)
+        for _bn in ('blue', 'green', 'red', 'nir'):
+            metrics[f'r2_{_bn}_after']   = _r2a[_bn]
+            metrics[f'rmse_{_bn}_after'] = _rmsea[_bn]
+
+    write_alignment_metrics(
+        alignment_metrics_filepath, source_filename, reference_filename, inlier_count,
+        len(all_src_pts), total_raw_matches, M, metrics
+    )
 
     # --- Diagnostic plot: falsecolor index comparison in the overlap region ---
     # Use NDVI, Green-Red, and Blue-NIR as the R/G/B display channels; these
