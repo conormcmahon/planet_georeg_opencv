@@ -42,8 +42,11 @@ Outputs (written under output_directory):
                             inlier keypoints, and inlier correspondence lines.
     alignment_metrics/    - a CSV log with one row per source file, giving
                             match counts and, per band, R^2, RMSE, and the
-                            OLS regression scale/intercept (target ~= scale *
-                            source + intercept) before and after alignment.
+                            RANSAC regression scale/intercept (source ~=
+                            scale * target + intercept), each computed twice
+                            — once using only RANSAC inliers, once using all
+                            sampled pixels — plus the inlier fraction, before
+                            and after alignment. See "Design notes" below.
 
 Design notes on the two reprojected-source versions:
     Per source file, the source raster is reprojected into the target's CRS
@@ -53,16 +56,31 @@ Design notes on the two reprojected-source versions:
         `resampling_method`. This preserves source detail and is the raster
         that keypoint matching, the TPS warp, and the final registered
         output are all built from.
-      - For R^2 / RMSE only: whichever of source_native / target is the
-        FINER resolution is resampled onto the other's (coarser) pixel grid
-        — with area averaging if it is at least twice as fine, otherwise
-        nearest-neighbor — regardless of `resampling_method`. Rather than
-        materializing this as a full raster (which, via GDAL reprojection,
-        can leave a multi-gigabyte, not-promptly-reclaimed memory footprint
-        when one image is tens of megapixels), it is implemented as
-        point-sampling: a bounded random sample of coarse-grid pixels is
-        drawn and the finer image is resampled only at those points, so
-        memory stays bounded regardless of image size.
+      - For R^2 / RMSE / regression only: whichever of source_native /
+        target is the FINER resolution is resampled onto the other's
+        (coarser) pixel grid — with area averaging if it is at least twice
+        as fine, otherwise nearest-neighbor — regardless of
+        `resampling_method`. Rather than materializing this as a full
+        raster (which, via GDAL reprojection, can leave a multi-gigabyte,
+        not-promptly-reclaimed memory footprint when one image is tens of
+        megapixels), it is implemented as point-sampling: a bounded random
+        sample of coarse-grid pixels is drawn and the finer image is
+        resampled only at those points, so memory stays bounded regardless
+        of image size.
+
+Design notes on the robust (RANSAC) regression:
+    Per band, a RANSAC linear regression fits source ~= scale*target +
+    intercept (predicting source values from target, so the fitted scale
+    maps target pixel values onto the source's radiometric scale). A pixel
+    pair counts as an inlier if |source - (scale*target + intercept)| is
+    less than 10% of the source band's own spatial standard deviation. This
+    rejects pairs affected by real land-cover change between acquisition
+    dates, clouds, or residual misregistration, which would otherwise
+    distort a plain least-squares fit. R^2, RMSE, scale, and intercept are
+    reported for both the inlier set and the full sample (see
+    alignment_metrics.csv columns above), and the RANSAC-inlier fit is also
+    used to rescale the target for the output_plots/ diagnostic PNGs (never
+    applied to the registered GeoTIFF).
 
 Ground-scale-aware processing:
     The Gaussian blur applied before SIFT is sized per image (not shared
@@ -142,6 +160,12 @@ band_map = [0, 1, 2, 3]
 # set to actual red/green/blue band indices for true-color display.
 display_bands = [0, 1, 2]
 
+# Percentile (from each end) used to clip outlier pixels when contrast-
+# stretching the output_plots/ band-composite images, e.g. 2.0 uses the
+# 2nd-98th percentile range. A handful of extreme pixels (sun glint, sensor
+# noise) would otherwise dominate a raw min/max stretch.
+display_percentile_clip = 2.0
+
 # One of: "nearest", "bilinear", "cubic", "average".
 resampling_method = "bilinear"
 
@@ -189,29 +213,59 @@ def compute_nd_indices(band_arrays):
     return out
 
 
-def normalize_pair(arr1, arr2):
-    """Jointly normalize two float arrays to [0, 1] using their combined range."""
-    lo = min(np.nanmin(arr1), np.nanmin(arr2))
-    hi = max(np.nanmax(arr1), np.nanmax(arr2))
-    if hi == lo:
+def normalize_pair(arr1, arr2, percentile_clip=None):
+    """
+    Jointly normalize two float arrays to [0, 1] using their combined range.
+
+    By default (percentile_clip=None) uses the exact combined min/max,
+    matching the ND-index feature-matching pipeline's established behavior.
+    If percentile_clip is given (e.g. 2.0), the shared display range is
+    instead the union of each array's OWN [percentile_clip, 100 -
+    percentile_clip] range (not the percentile of the two arrays pooled
+    together, which lets whichever array has more pixels or a wider native
+    spread dominate and crush the other's contrast to near-zero — e.g. an
+    8-bit sensor pooled with a higher-dynamic-range one). Values outside the
+    final range are clipped to [0, 1] — used for display composites, where
+    a handful of extreme pixels (sun glint, sensor noise) would otherwise
+    dominate a raw min/max stretch.
+    """
+    if percentile_clip is None:
+        lo = min(np.nanmin(arr1), np.nanmin(arr2))
+        hi = max(np.nanmax(arr1), np.nanmax(arr2))
+    else:
+        lo1, hi1 = np.nanpercentile(arr1, [percentile_clip, 100 - percentile_clip])
+        lo2, hi2 = np.nanpercentile(arr2, [percentile_clip, 100 - percentile_clip])
+        lo, hi = min(lo1, lo2), max(hi1, hi2)
+    if not (hi > lo):
         return np.zeros_like(arr1), np.zeros_like(arr2)
-    return (arr1 - lo) / (hi - lo), (arr2 - lo) / (hi - lo)
+    out1, out2 = (arr1 - lo) / (hi - lo), (arr2 - lo) / (hi - lo)
+    if percentile_clip is not None:
+        out1, out2 = np.clip(out1, 0.0, 1.0), np.clip(out2, 0.0, 1.0)
+    return out1, out2
 
 
-def normalize_single(arr):
+def normalize_single(arr, percentile_clip=None):
     """
     Normalize one float array to [0, 1] using its own range.
 
-    Used for band-composite display images: unlike ND indices (already
-    unitless ratios in roughly [-1, 1], so normalize_pair's shared range is
-    meaningful), raw band values from different sensors can have wildly
-    different native scales (e.g. PlanetScope surface reflectance vs. NAIP
-    8-bit DN), so each image needs its own independent contrast stretch.
+    Used for band-composite display images as a fallback when a joint
+    (regression-calibrated) stretch isn't available: unlike ND indices
+    (already unitless ratios in roughly [-1, 1]), raw band values from
+    different sensors can have wildly different native scales, so each
+    image needs its own contrast stretch. See normalize_pair for
+    percentile_clip.
     """
-    lo, hi = np.nanmin(arr), np.nanmax(arr)
-    if hi == lo:
+    if percentile_clip is None:
+        lo, hi = np.nanmin(arr), np.nanmax(arr)
+    else:
+        valid = arr[~np.isnan(arr)]
+        if valid.size == 0:
+            return np.zeros_like(arr)
+        lo, hi = np.percentile(valid, [percentile_clip, 100 - percentile_clip])
+    if hi <= lo:
         return np.zeros_like(arr)
-    return (arr - lo) / (hi - lo)
+    out = (arr - lo) / (hi - lo)
+    return np.clip(out, 0.0, 1.0) if percentile_clip is not None else out
 
 
 def cap_for_sift(img_u8, max_dim):
@@ -257,10 +311,48 @@ def to_uint8(arr):
     ).astype(np.uint8)
 
 
-def compute_band_metrics_matched_resolution(src_clip, tgt_clip, matched_pairs,
-                                              rng, max_sample_points=2_000_000):
+def ransac_linear_fit(x, y, threshold, rng, n_iterations=200, min_inliers=2):
     """
-    Estimate per-band Pearson R^2 and RMSE between src_clip and tgt_clip.
+    Robust linear regression y ~= slope*x + intercept via RANSAC.
+
+    Repeatedly fits a candidate line through two random points and keeps the
+    one with the most inliers (|residual| < threshold); the final slope/
+    intercept are then an ordinary-least-squares refit on that best inlier
+    set, and the inlier mask is recomputed against the refit line.
+
+    Returns (slope, intercept, inlier_mask). slope/intercept are NaN and
+    inlier_mask is all False if no valid candidate model was found.
+    """
+    n = len(x)
+    best_inliers = None
+    best_count = -1
+    for _ in range(n_iterations):
+        i, j = rng.choice(n, 2, replace=False)
+        if x[i] == x[j]:
+            continue
+        cand_slope = (y[j] - y[i]) / (x[j] - x[i])
+        cand_intercept = y[i] - cand_slope * x[i]
+        count = int(np.sum(np.abs(y - (cand_slope * x + cand_intercept)) < threshold))
+        if count > best_count:
+            best_count = count
+            best_inliers = np.abs(y - (cand_slope * x + cand_intercept)) < threshold
+
+    if best_inliers is None or best_count < min_inliers:
+        return np.nan, np.nan, np.zeros(n, dtype=bool)
+
+    slope, intercept = np.polyfit(x[best_inliers], y[best_inliers], 1)
+    inlier_mask = np.abs(y - (slope * x + intercept)) < threshold
+    return float(slope), float(intercept), inlier_mask
+
+
+def compute_band_metrics_matched_resolution(src_clip, tgt_clip, matched_pairs, rng,
+                                              max_sample_points=200_000,
+                                              ransac_iterations=200,
+                                              ransac_threshold_frac=0.1):
+    """
+    Estimate per-band agreement between src_clip and tgt_clip, robust to
+    outlier pixels (e.g. real land-cover change between acquisition dates,
+    clouds, or residual misregistration).
 
     src_clip and tgt_clip already share a CRS but may differ in pixel
     resolution. Whichever is finer is resampled onto the other (coarser)
@@ -276,14 +368,20 @@ def compute_band_metrics_matched_resolution(src_clip, tgt_clip, matched_pairs,
     draws a bounded random sample of valid coarse-grid pixels and resamples
     only at those points, so memory stays bounded regardless of image size.
 
-    Also fits an ordinary-least-squares linear regression target ~= scale *
-    source + intercept per band (on the same sample used for R^2 / RMSE).
-    This is the transform that maps source pixel values onto the target's
-    radiometric scale — used elsewhere to rescale the source for display so
-    that source/target diagnostic plots share a comparable color scale
-    despite the two sensors having very different native value ranges.
+    Per band, a RANSAC linear regression source ~= scale*target + intercept
+    is fit (predicting source values FROM target, so the fitted scale maps
+    target pixel values onto the source's radiometric scale — used
+    elsewhere to rescale the target for display). The inlier threshold is
+    10% of the source band's own spatial standard deviation (computed over
+    all of src_clip, not just the sample). R^2, RMSE, scale, and intercept
+    are reported twice per band: once using only RANSAC inliers, and once
+    using the full sample (plain OLS, no outlier rejection) — plus the
+    fraction of the full sample classified as inliers.
 
-    Returns four dicts keyed by source band index: r2, rmse, scale, intercept.
+    Returns a dict of dicts, each keyed by source band index:
+        {'r2_inliers', 'r2_all', 'rmse_inliers', 'rmse_all',
+         'scale_inliers', 'scale_all', 'intercept_inliers', 'intercept_all',
+         'inlier_frac'}
     """
     src_transform = src_clip.rio.transform()
     tgt_transform = tgt_clip.rio.transform()
@@ -305,7 +403,15 @@ def compute_band_metrics_matched_resolution(src_clip, tgt_clip, matched_pairs,
     box_size = max(1, int(round(ratio)))
     inv_fine_transform = ~fine_transform
 
-    r2, rmse, scale, intercept = {}, {}, {}, {}
+    stat_names = ('r2_inliers', 'r2_all', 'rmse_inliers', 'rmse_all',
+                  'scale_inliers', 'scale_all', 'intercept_inliers', 'intercept_all',
+                  'inlier_frac')
+    out = {name: {} for name in stat_names}
+
+    def _set_nan(src_idx):
+        for name in stat_names:
+            out[name][src_idx] = np.nan
+
     for src_idx, tgt_idx in matched_pairs:
         fine_idx, coarse_idx = (src_idx, tgt_idx) if src_is_finer else (tgt_idx, src_idx)
 
@@ -315,8 +421,7 @@ def compute_band_metrics_matched_resolution(src_clip, tgt_clip, matched_pairs,
             sel = rng.choice(len(rows), max_sample_points, replace=False)
             rows, cols = rows[sel], cols[sel]
         if len(rows) < 2:
-            r2[src_idx], rmse[src_idx] = np.nan, np.nan
-            scale[src_idx], intercept[src_idx] = np.nan, np.nan
+            _set_nan(src_idx)
             continue
 
         world_x, world_y = coarse_transform * (cols.astype(np.float64), rows.astype(np.float64))
@@ -353,21 +458,43 @@ def compute_band_metrics_matched_resolution(src_clip, tgt_clip, matched_pairs,
 
         valid = ~(np.isnan(s_vals) | np.isnan(t_vals))
         if valid.sum() < 2:
-            r2[src_idx], rmse[src_idx] = np.nan, np.nan
-            scale[src_idx], intercept[src_idx] = np.nan, np.nan
+            _set_nan(src_idx)
             continue
-        a, b = s_vals[valid], t_vals[valid]
-        rmse[src_idx] = float(np.sqrt(np.mean((a - b) ** 2)))
-        corr = np.corrcoef(a, b)[0, 1]
-        r2[src_idx] = float(corr ** 2) if np.isfinite(corr) else np.nan
+        s, t = s_vals[valid], t_vals[valid]
 
-        # OLS fit of target ~= scale * source + intercept.
-        if np.std(a) > 0:
-            _slope, _intercept = np.polyfit(a, b, 1)
-            scale[src_idx], intercept[src_idx] = float(_slope), float(_intercept)
+        # --- Stats over all sampled pixels (no outlier rejection) ---
+        out['rmse_all'][src_idx] = float(np.sqrt(np.mean((s - t) ** 2)))
+        corr = np.corrcoef(s, t)[0, 1]
+        out['r2_all'][src_idx] = float(corr ** 2) if np.isfinite(corr) else np.nan
+        if np.std(t) > 0:
+            _slope, _intercept = np.polyfit(t, s, 1)  # source ~= slope*target + intercept
+            out['scale_all'][src_idx], out['intercept_all'][src_idx] = float(_slope), float(_intercept)
         else:
-            scale[src_idx], intercept[src_idx] = np.nan, np.nan
-    return r2, rmse, scale, intercept
+            out['scale_all'][src_idx], out['intercept_all'][src_idx] = np.nan, np.nan
+
+        # --- RANSAC: robust source ~= scale*target + intercept, with inlier stats ---
+        threshold = ransac_threshold_frac * float(
+            np.nanstd(src_clip.isel(band=src_idx).values.astype(np.float32))
+        )
+        _, _, inlier_mask = ransac_linear_fit(t, s, threshold, rng, n_iterations=ransac_iterations)
+        out['inlier_frac'][src_idx] = float(inlier_mask.mean()) if len(inlier_mask) else np.nan
+
+        if inlier_mask.sum() >= 2:
+            s_in, t_in = s[inlier_mask], t[inlier_mask]
+            out['rmse_inliers'][src_idx] = float(np.sqrt(np.mean((s_in - t_in) ** 2)))
+            corr_in = np.corrcoef(s_in, t_in)[0, 1]
+            out['r2_inliers'][src_idx] = float(corr_in ** 2) if np.isfinite(corr_in) else np.nan
+            if np.std(t_in) > 0:
+                _slope_in, _intercept_in = np.polyfit(t_in, s_in, 1)
+                out['scale_inliers'][src_idx] = float(_slope_in)
+                out['intercept_inliers'][src_idx] = float(_intercept_in)
+            else:
+                out['scale_inliers'][src_idx], out['intercept_inliers'][src_idx] = np.nan, np.nan
+        else:
+            out['r2_inliers'][src_idx], out['rmse_inliers'][src_idx] = np.nan, np.nan
+            out['scale_inliers'][src_idx], out['intercept_inliers'][src_idx] = np.nan, np.nan
+
+    return out
 
 
 def find_overlap(image1, image2):
@@ -440,14 +567,23 @@ def spatially_thin_keypoints(tgt_pts, src_pts, max_control_points, clip_w, clip_
 
 def build_metric_keys(matched_pairs):
     keys = []
-    for src_idx, _ in matched_pairs:
-        keys += [f"r2_src{src_idx}_before", f"rmse_src{src_idx}_before",
-                  f"scale_src{src_idx}_before", f"intercept_src{src_idx}_before"]
-    for src_idx, _ in matched_pairs:
-        keys += [f"r2_src{src_idx}_after", f"rmse_src{src_idx}_after",
-                  f"scale_src{src_idx}_after", f"intercept_src{src_idx}_after"]
+    for when in ("before", "after"):
+        for src_idx, _ in matched_pairs:
+            for stat in ("r2", "rmse", "scale", "intercept"):
+                for subset in ("inliers", "all"):
+                    keys.append(f"{stat}_src{src_idx}_{when}_{subset}")
+            keys.append(f"inlier_frac_src{src_idx}_{when}")
     keys += ["mean_kp_dist_before", "mean_kp_dist_after", "avg_dx_px", "avg_dy_px"]
     return keys
+
+
+def store_band_metrics(metrics, result, matched_pairs, when):
+    """Copy a compute_band_metrics_matched_resolution() result into `metrics`."""
+    for src_idx, _ in matched_pairs:
+        for stat in ("r2", "rmse", "scale", "intercept"):
+            for subset in ("inliers", "all"):
+                metrics[f"{stat}_src{src_idx}_{when}_{subset}"] = result[f"{stat}_{subset}"][src_idx]
+        metrics[f"inlier_frac_src{src_idx}_{when}"] = result["inlier_frac"][src_idx]
 
 
 def write_alignment_metrics(filepath, metric_keys, source_filename, target_filename,
@@ -600,14 +736,10 @@ for source_filepath in source_files:
     # target's exact pixel grid, one band at a time — this is the "matching
     # resolution to the target" reprojected source version, used only for
     # error metrics and never materialized as a full multi-band raster.
-    _r2b, _rmseb, _scaleb, _interceptb = compute_band_metrics_matched_resolution(
+    _metrics_before = compute_band_metrics_matched_resolution(
         src_clip, tgt_clip, matched_band_pairs, rng
     )
-    for src_idx, _ in matched_band_pairs:
-        metrics[f'r2_src{src_idx}_before']        = _r2b[src_idx]
-        metrics[f'rmse_src{src_idx}_before']      = _rmseb[src_idx]
-        metrics[f'scale_src{src_idx}_before']     = _scaleb[src_idx]
-        metrics[f'intercept_src{src_idx}_before'] = _interceptb[src_idx]
+    store_band_metrics(metrics, _metrics_before, matched_band_pairs, "before")
 
     # --- Extract matched bands and compute all pairwise ND indices ---
     src_band_arrays = extract_band_arrays(src_clip, [i for i, _ in matched_band_pairs])
@@ -643,13 +775,13 @@ for source_filepath in source_files:
     # bands) so plots are visually interpretable. Raw band values from
     # different sensors can have very different native ranges (e.g.
     # PlanetScope surface reflectance vs. NAIP 8-bit DN), so before display
-    # each source channel is rescaled onto the target's radiometric scale
-    # using the before-alignment OLS fit (target ~= scale*source + intercept,
-    # from compute_band_metrics_matched_resolution above) and the two are
-    # then jointly normalized — this is only a display transform and is
-    # never applied to the registered GeoTIFF output. Falls back to
+    # each target channel is rescaled onto the source's radiometric scale
+    # using the before-alignment RANSAC-inlier fit (source ~= scale*target +
+    # intercept, from compute_band_metrics_matched_resolution above) and the
+    # two are then jointly normalized — this is only a display transform and
+    # is never applied to the registered GeoTIFF output. Falls back to
     # independent per-image normalization if the fit is unavailable (e.g.
-    # too few valid samples). Built here (rather than later, next to the
+    # too few RANSAC inliers). Built here (rather than later, next to the
     # plotting code) because src_clip / tgt_clip are freed before plotting
     # to bound memory; capped immediately to a bounded resolution for the
     # same reason.
@@ -657,11 +789,15 @@ for source_filepath in source_files:
     for _b, _t in zip(display_bands, display_target_bands):
         _s_arr = src_clip.isel(band=_b).values.astype(np.float32)
         _t_arr = tgt_clip.isel(band=_t).values.astype(np.float32)
-        _b_scale, _b_intercept = _scaleb[_b], _interceptb[_b]
+        _b_scale = _metrics_before['scale_inliers'][_b]
+        _b_intercept = _metrics_before['intercept_inliers'][_b]
         if np.isfinite(_b_scale) and np.isfinite(_b_intercept):
-            _s_norm, _t_norm = normalize_pair(_b_scale * _s_arr + _b_intercept, _t_arr)
+            _s_norm, _t_norm = normalize_pair(
+                _s_arr, _b_scale * _t_arr + _b_intercept, percentile_clip=display_percentile_clip
+            )
         else:
-            _s_norm, _t_norm = normalize_single(_s_arr), normalize_single(_t_arr)
+            _s_norm = normalize_single(_s_arr, percentile_clip=display_percentile_clip)
+            _t_norm = normalize_single(_t_arr, percentile_clip=display_percentile_clip)
         _src_display_channels.append(to_uint8(_s_norm))
         _tgt_display_channels.append(to_uint8(_t_norm))
     src_display_rgb, src_display_scale = cap_for_sift(
@@ -950,14 +1086,10 @@ for source_filepath in source_files:
     # target's exact grid (over the overlap only, one band at a time) for a
     # fair pixel comparison.
     _warped_clip = source_registered.rio.clip_box(minx=left, miny=bottom, maxx=right, maxy=top)
-    _r2a, _rmsea, _scalea, _intercepta = compute_band_metrics_matched_resolution(
+    _metrics_after = compute_band_metrics_matched_resolution(
         _warped_clip, tgt_clip, matched_band_pairs, rng
     )
-    for src_idx, _ in matched_band_pairs:
-        metrics[f'r2_src{src_idx}_after']        = _r2a[src_idx]
-        metrics[f'rmse_src{src_idx}_after']      = _rmsea[src_idx]
-        metrics[f'scale_src{src_idx}_after']     = _scalea[src_idx]
-        metrics[f'intercept_src{src_idx}_after'] = _intercepta[src_idx]
+    store_band_metrics(metrics, _metrics_after, matched_band_pairs, "after")
 
     write_alignment_metrics(
         alignment_metrics_filepath, metric_keys, source_filename, target_filename, inlier_count,
