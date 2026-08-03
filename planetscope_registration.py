@@ -17,9 +17,12 @@ distance_threshold_pixels = 50  # max allowed pixel-space distance between match
 ransac_reproj_threshold = 2.0   # RANSAC reprojection error threshold (pixels)
 blur_kernel_size = (5, 5)     # Gaussian blur kernel; same for both images (both are 3 m PlanetScope)
 
-source_directory = "/path/to/source_planetscope/"   # PlanetScope scenes to register
-reference_filepath = "/path/to/reference.tif"       # well-geolocated reference image
-output_directory = "/path/to/output/"
+source_directory = "/home/conor/src/planet_georeg_opencv/example_imagery/"
+reference_filepath = "/home/conor/src/planet_georeg_opencv/example_imagery/20250318_161156_07_24e6_3B_AnalyticMS_SR_harmonized_clip.tif"
+output_directory = "/home/conor/test_outputs/"
+#source_directory = "/path/to/source_planetscope/"   # PlanetScope scenes to register
+#reference_filepath = "/path/to/reference.tif"       # well-geolocated reference image
+#output_directory = "/path/to/output/"
 
 # --- PlanetScope band definitions (0-indexed) ---
 # Dove Classic / Dove-R (4-band): Blue, Green, Red, NIR

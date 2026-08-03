@@ -13,10 +13,10 @@ from scipy.interpolate import RBFInterpolator
 # --- Settings ---
 min_pixel_count = 1000        # minimum valid pixels in overlap region to attempt registration
 min_keypoints = 10            # minimum keypoints per index channel to attempt matching
-lowe_ratio_threshold = 0.75   # Lowe's ratio test threshold
+lowe_ratio_threshold = 1000   # Lowe's ratio test threshold
 distance_threshold_pixels = 50  # max allowed pixel-space distance between matched keypoints
 ransac_reproj_threshold = 2.0   # RANSAC reprojection error threshold (pixels)
-blur_kernel_size = (5, 5)     # Gaussian blur kernel; same for both images (both are 3 m PlanetScope)
+blur_kernel_size = (3, 3)     # Gaussian blur kernel; same for both images (both are 3 m PlanetScope)
 
 # --- Local warp settings ---
 # Maximum number of RANSAC inliers to use as control points for the TPS warp.
@@ -26,7 +26,7 @@ blur_kernel_size = (5, 5)     # Gaussian blur kernel; same for both images (both
 # - Larger values → denser, more faithful warp field; slower RBF solve (O(N³))
 # - Smaller values → coarser warp; faster solve
 # Set to None to use all RANSAC inliers without any subsampling.
-tps_max_control_points = 500
+tps_max_control_points = 2000
 
 # Resolution (in pixels, per axis) of the coarse grid on which the RBF
 # displacement field is first evaluated. The full-resolution field is then
@@ -34,9 +34,15 @@ tps_max_control_points = 500
 # accuracy for speed; 200–400 is a practical range for 3–4K imagery.
 tps_coarse_grid_size = 300
 
-source_directory = "/path/to/source_planetscope/"   # PlanetScope scenes to register
-reference_filepath = "/path/to/reference.tif"       # well-geolocated reference image
-output_directory = "/path/to/output/"
+# Output plot parameters
+max_lines_match_lines = 2000
+
+source_directory = "/home/conor/src/planet_georeg_opencv/example_imagery/"
+reference_filepath = "/home/conor/src/planet_georeg_opencv/example_imagery/20250318_161156_07_24e6_3B_AnalyticMS_SR_harmonized_clip.tif"
+output_directory = "/home/conor/test_outputs_local/"
+#source_directory = "/path/to/source_planetscope/"   # PlanetScope scenes to register
+#reference_filepath = "/path/to/reference.tif"       # well-geolocated reference image
+#output_directory = "/path/to/output/"
 
 # --- PlanetScope band definitions (0-indexed) ---
 # Dove Classic / Dove-R (4-band): Blue, Green, Red, NIR
@@ -711,9 +717,8 @@ for source_filepath in source_files:
     canvas[:disp_src_h, :disp_src_w] = src_disp
     canvas[:disp_ref_h, disp_src_w:disp_src_w + disp_ref_w] = ref_disp
 
-    max_lines = 300
-    if len(inlier_src) > max_lines:
-        idx = rng.choice(len(inlier_src), max_lines, replace=False)
+    if len(inlier_src) > max_lines_match_lines:
+        idx = rng.choice(len(inlier_src), max_lines_match_lines, replace=False)
         plot_src_pts = inlier_src[idx]
         plot_ref_pts = inlier_ref[idx]
     else:

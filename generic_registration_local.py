@@ -22,39 +22,53 @@ Inputs (see "Settings" section below):
                          least two source bands must have a match so that a
                          normalized-difference index can be computed.
     resampling_method - one of "nearest", "bilinear", "cubic", "average".
-                         Controls both the CRS reprojection / resolution
-                         matching steps (via rasterio) and the final TPS
-                         pixel warp (via OpenCV). "average" is intended for
-                         cases where the source has finer spatial resolution
-                         than the target (area-weighted downsampling).
+                         Controls only the final reprojected output raster:
+                         the CRS reprojection to source_native (via rasterio)
+                         and the final TPS pixel warp (via OpenCV). It does
+                         NOT affect the R^2 / RMSE metrics — see "Design
+                         notes" below.
+    display_bands     - list of 3 0-indexed SOURCE band indices rendered as
+                         (R, G, B) in the diagnostic PNGs under
+                         output_plots/. Each must have a match in band_map.
+                         Defaults to the first three bands; set to actual
+                         red/green/blue band indices for true-color display.
 
 Outputs (written under output_directory):
     registered/          - one registered GeoTIFF per source file, on a grid
                             that keeps the source's approximate native
                             resolution (reprojected into the target's CRS).
-    output_plots/         - diagnostic PNGs per source file (band-index
-                            falsecolor comparison, RANSAC inlier keypoints,
-                            inlier correspondence lines).
+    output_plots/         - diagnostic PNGs per source file: a band-composite
+                            comparison, all Lowe-threshold matches, RANSAC
+                            inlier keypoints, and inlier correspondence lines.
     alignment_metrics/    - a CSV log with one row per source file, giving
-                            match counts and per-band R^2 / RMSE before and
-                            after alignment.
+                            match counts and, per band, R^2, RMSE, and the
+                            OLS regression scale/intercept (target ~= scale *
+                            source + intercept) before and after alignment.
 
 Design notes on the two reprojected-source versions:
     Per source file, the source raster is reprojected into the target's CRS
     in two distinct ways:
       - source_native: reprojected to the target CRS but resampled at
-        approximately the source's own native resolution. This preserves
-        source detail and is the raster that keypoint matching, the TPS
-        warp, and the final registered output are all built from.
-      - source_matched: conceptually, the source resampled onto the target's
-        exact pixel grid, used only to compute before/after R^2 and RMSE
-        (which require comparable samples on both images). Rather than
+        approximately the source's own native resolution, using
+        `resampling_method`. This preserves source detail and is the raster
+        that keypoint matching, the TPS warp, and the final registered
+        output are all built from.
+      - For R^2 / RMSE only: whichever of source_native / target is the
+        FINER resolution is resampled onto the other's (coarser) pixel grid
+        — with area averaging if it is at least twice as fine, otherwise
+        nearest-neighbor — regardless of `resampling_method`. Rather than
         materializing this as a full raster (which, via GDAL reprojection,
         can leave a multi-gigabyte, not-promptly-reclaimed memory footprint
-        when the target is tens of megapixels), it is implemented as
-        point-sampling: a bounded random sample of target pixels is drawn
-        and the source is interpolated at the corresponding world
-        coordinates, so memory stays bounded regardless of image size.
+        when one image is tens of megapixels), it is implemented as
+        point-sampling: a bounded random sample of coarse-grid pixels is
+        drawn and the finer image is resampled only at those points, so
+        memory stays bounded regardless of image size.
+
+Ground-scale-aware processing:
+    The Gaussian blur applied before SIFT is sized per image (not shared
+    between source and target) so it covers approximately the same
+    real-world ground footprint regardless of each image's resolution — see
+    blur_kernel_base_size / blur_kernel_reference_resolution below.
 """
 
 import rioxarray as rxr
@@ -69,7 +83,7 @@ import gc
 from itertools import combinations
 from rasterio.enums import Resampling
 from scipy.interpolate import RBFInterpolator
-from scipy.ndimage import map_coordinates
+from scipy.ndimage import map_coordinates, uniform_filter
 
 # --- Settings ---
 min_pixel_count = 1000        # minimum valid pixels in overlap region to attempt registration
@@ -78,7 +92,17 @@ lowe_ratio_threshold = 1000   # Lowe's ratio test threshold
 distance_threshold_pixels = 50  # max allowed pixel-space distance between matched keypoints
                                  # (evaluated in source clip-pixel units; see scale_x/scale_y below)
 ransac_reproj_threshold = 2.0   # RANSAC reprojection error threshold (source clip pixels)
-blur_kernel_size = (3, 3)     # Gaussian blur kernel applied to both images before SIFT
+
+# Gaussian blur kernel applied before SIFT, expressed as a pixel size at
+# blur_kernel_reference_resolution (real-world units matching the target/
+# source CRS, e.g. meters for UTM). Each image's actual kernel size is
+# scaled by blur_kernel_reference_resolution / that image's own pixel size,
+# rounded to the nearest odd integer, so the blur approximates the same
+# real-world ground footprint regardless of the image's resolution (e.g. a
+# 3 px kernel at 3 m becomes ~15 px at 0.6 m).
+blur_kernel_base_size = 3
+blur_kernel_reference_resolution = 3.0
+
 max_sift_dimension = 4000     # cap each ND-index channel's larger side before SIFT; clips
                                # larger than this (e.g. a high-resolution target) are downsampled
                                # for detection only, and matched keypoint coordinates are rescaled
@@ -102,6 +126,7 @@ tps_coarse_grid_size = 300
 
 # Output plot parameters
 max_lines_match_lines = 2000
+max_lowe_match_display_points = 2000  # cap on points shown in the "all Lowe matches" plot
 
 source_directory  = "/path/to/source_images/"   # rasters to be registered
 target_filepath   = "/path/to/target.tif"        # well-geolocated target raster
@@ -110,6 +135,12 @@ output_directory  = "/path/to/output/"
 # band_map[i] = 0-indexed target band matching 0-indexed source band i, or -1
 # if source band i has no match in the target image.
 band_map = [0, 1, 2, 3]
+
+# 0-indexed SOURCE band indices rendered as (R, G, B) in the diagnostic PNGs
+# under output_plots/. Each must have a match in band_map (its corresponding
+# target band is looked up automatically). Defaults to the first three bands;
+# set to actual red/green/blue band indices for true-color display.
+display_bands = [0, 1, 2]
 
 # One of: "nearest", "bilinear", "cubic", "average".
 resampling_method = "bilinear"
@@ -167,15 +198,32 @@ def normalize_pair(arr1, arr2):
     return (arr1 - lo) / (hi - lo), (arr2 - lo) / (hi - lo)
 
 
+def normalize_single(arr):
+    """
+    Normalize one float array to [0, 1] using its own range.
+
+    Used for band-composite display images: unlike ND indices (already
+    unitless ratios in roughly [-1, 1], so normalize_pair's shared range is
+    meaningful), raw band values from different sensors can have wildly
+    different native scales (e.g. PlanetScope surface reflectance vs. NAIP
+    8-bit DN), so each image needs its own independent contrast stretch.
+    """
+    lo, hi = np.nanmin(arr), np.nanmax(arr)
+    if hi == lo:
+        return np.zeros_like(arr)
+    return (arr - lo) / (hi - lo)
+
+
 def cap_for_sift(img_u8, max_dim):
     """
     Downsample img_u8 (if needed) so its larger side is at most max_dim.
+    Works on both single-channel (H, W) and multi-channel (H, W, C) images.
 
     Returns (image_for_detection, scale), where scale = detection_size /
     original_size. Detected keypoint coordinates must be divided by `scale`
     to convert them back to the original image's pixel space.
     """
-    h, w = img_u8.shape
+    h, w = img_u8.shape[:2]
     scale = min(1.0, max_dim / max(h, w))
     if scale >= 1.0:
         return img_u8, 1.0
@@ -186,6 +234,22 @@ def cap_for_sift(img_u8, max_dim):
     return small, scale
 
 
+def resolution_scaled_kernel_size(base_size, base_resolution, image_resolution):
+    """
+    Scale a Gaussian blur kernel size so it covers approximately the same
+    real-world ground footprint at a different pixel resolution.
+
+    E.g. base_size=3 at base_resolution=3.0 (m) gives 15 at
+    image_resolution=0.6 (m). Rounds to the nearest odd integer (required by
+    cv2.GaussianBlur) and never returns less than 1.
+    """
+    k = int(round(base_size * (base_resolution / image_resolution)))
+    k = max(1, k)
+    if k % 2 == 0:
+        k += 1
+    return k
+
+
 def to_uint8(arr):
     """Convert a float [0, 1] array to uint8 [0, 255], mapping NaN to 0."""
     return np.nan_to_num(
@@ -193,83 +257,117 @@ def to_uint8(arr):
     ).astype(np.uint8)
 
 
-_METRIC_SAMPLE_INTERP_ORDER = {
-    "nearest":  0,
-    "bilinear": 1,
-    "cubic":    3,
-    # A true area-weighted average isn't meaningful for a point sample, so
-    # this is approximated as bilinear — acceptable since this is only a
-    # statistical error estimate, not the final resampled image.
-    "average":  1,
-}
-
-
-def compute_band_metrics_matched_resolution(src_clip, tgt_clip, matched_pairs, resampling_method,
+def compute_band_metrics_matched_resolution(src_clip, tgt_clip, matched_pairs,
                                               rng, max_sample_points=2_000_000):
     """
-    Estimate per-band Pearson R^2 and RMSE between src_clip and tgt_clip on
-    the target's pixel grid, WITHOUT materializing a full "source resampled
-    to target resolution" raster (which, via GDAL reprojection, can leave a
-    multi-gigabyte, not-promptly-reclaimed memory footprint when the target
-    is tens of megapixels — confirmed by profiling this pipeline against a
-    0.6 m target overlapping a 3 m source).
+    Estimate per-band Pearson R^2 and RMSE between src_clip and tgt_clip.
 
-    Instead, a bounded random sample of valid target pixels is drawn per
-    band; each sampled pixel's world coordinate is converted into src_clip's
-    pixel space (via each array's own affine transform) and the source is
-    interpolated there with scipy.ndimage.map_coordinates. This only ever
-    allocates arrays of size max_sample_points, regardless of image size.
+    src_clip and tgt_clip already share a CRS but may differ in pixel
+    resolution. Whichever is finer is resampled onto the other (coarser)
+    image's pixel grid: with area averaging if it is at least twice as fine,
+    otherwise with nearest-neighbor sampling. This direction/method choice is
+    automatic and independent of `resampling_method`, which only controls
+    the final reprojected output raster.
 
-    Returns two dicts keyed by source band index: r2, rmse.
+    Rather than materializing a full resampled raster (which, via GDAL
+    reprojection, can leave a multi-gigabyte, not-promptly-reclaimed memory
+    footprint when one image is tens of megapixels — confirmed by profiling
+    this pipeline against a 0.6 m target overlapping a 3 m source), this
+    draws a bounded random sample of valid coarse-grid pixels and resamples
+    only at those points, so memory stays bounded regardless of image size.
+
+    Also fits an ordinary-least-squares linear regression target ~= scale *
+    source + intercept per band (on the same sample used for R^2 / RMSE).
+    This is the transform that maps source pixel values onto the target's
+    radiometric scale — used elsewhere to rescale the source for display so
+    that source/target diagnostic plots share a comparable color scale
+    despite the two sensors having very different native value ranges.
+
+    Returns four dicts keyed by source band index: r2, rmse, scale, intercept.
     """
-    interp_order = _METRIC_SAMPLE_INTERP_ORDER[resampling_method]
-    tgt_transform = tgt_clip.rio.transform()
     src_transform = src_clip.rio.transform()
-    inv_src_transform = ~src_transform
+    tgt_transform = tgt_clip.rio.transform()
+    src_res = abs(src_transform.a)
+    tgt_res = abs(tgt_transform.a)
 
-    r2, rmse = {}, {}
+    src_is_finer = src_res < tgt_res
+    if src_is_finer:
+        fine_clip, coarse_clip = src_clip, tgt_clip
+        fine_transform, coarse_transform = src_transform, tgt_transform
+        fine_res, coarse_res = src_res, tgt_res
+    else:
+        fine_clip, coarse_clip = tgt_clip, src_clip
+        fine_transform, coarse_transform = tgt_transform, src_transform
+        fine_res, coarse_res = tgt_res, src_res
+
+    ratio = coarse_res / fine_res if fine_res > 0 else 1.0
+    use_average = ratio >= 2.0
+    box_size = max(1, int(round(ratio)))
+    inv_fine_transform = ~fine_transform
+
+    r2, rmse, scale, intercept = {}, {}, {}, {}
     for src_idx, tgt_idx in matched_pairs:
-        tgt_band = tgt_clip.isel(band=tgt_idx).values.astype(np.float32)
-        tgt_rows, tgt_cols = np.where(~np.isnan(tgt_band))
-        if len(tgt_rows) > max_sample_points:
-            sel = rng.choice(len(tgt_rows), max_sample_points, replace=False)
-            tgt_rows, tgt_cols = tgt_rows[sel], tgt_cols[sel]
+        fine_idx, coarse_idx = (src_idx, tgt_idx) if src_is_finer else (tgt_idx, src_idx)
 
-        if len(tgt_rows) < 2:
+        coarse_band = coarse_clip.isel(band=coarse_idx).values.astype(np.float32)
+        rows, cols = np.where(~np.isnan(coarse_band))
+        if len(rows) > max_sample_points:
+            sel = rng.choice(len(rows), max_sample_points, replace=False)
+            rows, cols = rows[sel], cols[sel]
+        if len(rows) < 2:
             r2[src_idx], rmse[src_idx] = np.nan, np.nan
+            scale[src_idx], intercept[src_idx] = np.nan, np.nan
             continue
 
-        world_x, world_y = tgt_transform * (tgt_cols.astype(np.float64), tgt_rows.astype(np.float64))
-        src_col, src_row = inv_src_transform * (world_x, world_y)
+        world_x, world_y = coarse_transform * (cols.astype(np.float64), rows.astype(np.float64))
+        fine_col, fine_row = inv_fine_transform * (world_x, world_y)
 
-        # NaN nodata pixels are filled before interpolating: for order > 1,
-        # map_coordinates' spline prefilter is a global recursive filter, so
-        # even a single NaN in the input would otherwise contaminate the
-        # entire output. Validity is instead tracked with a separate
-        # nearest-neighbor sample of the nodata mask (mirroring how the final
-        # TPS warp propagates nodata through cv2.remap).
-        src_band = src_clip.isel(band=src_idx).values.astype(np.float32)
-        src_band_nan = np.isnan(src_band)
+        fine_band = fine_clip.isel(band=fine_idx).values.astype(np.float32)
+        fine_nan = np.isnan(fine_band)
+
+        if use_average:
+            # Local area average, respecting nodata: sum of filled values
+            # over a box divided by the fraction of valid pixels in that box.
+            filled = np.where(fine_nan, 0.0, fine_band)
+            valid_frac = uniform_filter((~fine_nan).astype(np.float32), size=box_size,
+                                         mode='constant', cval=0.0)
+            mean_filled = uniform_filter(filled, size=box_size, mode='constant', cval=0.0)
+            with np.errstate(invalid='ignore', divide='ignore'):
+                fine_band_resampled = np.where(valid_frac > 0, mean_filled / valid_frac, np.nan)
+        else:
+            fine_band_resampled = fine_band
+
+        resampled_nan = np.isnan(fine_band_resampled)
         sampled = map_coordinates(
-            np.where(src_band_nan, 0.0, src_band), [src_row, src_col],
-            order=interp_order, mode='constant', cval=0.0
+            np.where(resampled_nan, 0.0, fine_band_resampled), [fine_row, fine_col],
+            order=0, mode='constant', cval=0.0
         )
         sampled_nan = map_coordinates(
-            src_band_nan.astype(np.float32), [src_row, src_col],
+            resampled_nan.astype(np.float32), [fine_row, fine_col],
             order=0, mode='constant', cval=1.0
         ) > 0.5
         sampled[sampled_nan] = np.nan
 
-        t = tgt_band[tgt_rows, tgt_cols]
-        valid = ~(np.isnan(sampled) | np.isnan(t))
+        coarse_vals = coarse_band[rows, cols]
+        s_vals, t_vals = (sampled, coarse_vals) if src_is_finer else (coarse_vals, sampled)
+
+        valid = ~(np.isnan(s_vals) | np.isnan(t_vals))
         if valid.sum() < 2:
             r2[src_idx], rmse[src_idx] = np.nan, np.nan
+            scale[src_idx], intercept[src_idx] = np.nan, np.nan
             continue
-        a, b = sampled[valid], t[valid]
+        a, b = s_vals[valid], t_vals[valid]
         rmse[src_idx] = float(np.sqrt(np.mean((a - b) ** 2)))
         corr = np.corrcoef(a, b)[0, 1]
         r2[src_idx] = float(corr ** 2) if np.isfinite(corr) else np.nan
-    return r2, rmse
+
+        # OLS fit of target ~= scale * source + intercept.
+        if np.std(a) > 0:
+            _slope, _intercept = np.polyfit(a, b, 1)
+            scale[src_idx], intercept[src_idx] = float(_slope), float(_intercept)
+        else:
+            scale[src_idx], intercept[src_idx] = np.nan, np.nan
+    return r2, rmse, scale, intercept
 
 
 def find_overlap(image1, image2):
@@ -343,9 +441,11 @@ def spatially_thin_keypoints(tgt_pts, src_pts, max_control_points, clip_w, clip_
 def build_metric_keys(matched_pairs):
     keys = []
     for src_idx, _ in matched_pairs:
-        keys += [f"r2_src{src_idx}_before", f"rmse_src{src_idx}_before"]
+        keys += [f"r2_src{src_idx}_before", f"rmse_src{src_idx}_before",
+                  f"scale_src{src_idx}_before", f"intercept_src{src_idx}_before"]
     for src_idx, _ in matched_pairs:
-        keys += [f"r2_src{src_idx}_after", f"rmse_src{src_idx}_after"]
+        keys += [f"r2_src{src_idx}_after", f"rmse_src{src_idx}_after",
+                  f"scale_src{src_idx}_after", f"intercept_src{src_idx}_after"]
     keys += ["mean_kp_dist_before", "mean_kp_dist_after", "avg_dx_px", "avg_dy_px"]
     return keys
 
@@ -386,6 +486,15 @@ if len(matched_band_pairs) < 2:
         "(need at least two matched bands to compute a normalized-difference index)."
     )
 metric_keys = build_metric_keys(matched_band_pairs)
+
+if len(display_bands) != 3:
+    raise ValueError(f"display_bands must have exactly 3 entries (R, G, B), got {display_bands!r}")
+for _b in display_bands:
+    if not (0 <= _b < len(band_map)) or band_map[_b] == -1:
+        raise ValueError(
+            f"display_bands entry {_b} is not a valid source band with a match in band_map."
+        )
+display_target_bands = [band_map[b] for b in display_bands]
 
 # ---------------------------------------------------------------------------
 # Initialise output directories
@@ -491,12 +600,14 @@ for source_filepath in source_files:
     # target's exact pixel grid, one band at a time — this is the "matching
     # resolution to the target" reprojected source version, used only for
     # error metrics and never materialized as a full multi-band raster.
-    _r2b, _rmseb = compute_band_metrics_matched_resolution(
-        src_clip, tgt_clip, matched_band_pairs, resampling_method, rng
+    _r2b, _rmseb, _scaleb, _interceptb = compute_band_metrics_matched_resolution(
+        src_clip, tgt_clip, matched_band_pairs, rng
     )
     for src_idx, _ in matched_band_pairs:
-        metrics[f'r2_src{src_idx}_before']   = _r2b[src_idx]
-        metrics[f'rmse_src{src_idx}_before'] = _rmseb[src_idx]
+        metrics[f'r2_src{src_idx}_before']        = _r2b[src_idx]
+        metrics[f'rmse_src{src_idx}_before']      = _rmseb[src_idx]
+        metrics[f'scale_src{src_idx}_before']     = _scaleb[src_idx]
+        metrics[f'intercept_src{src_idx}_before'] = _interceptb[src_idx]
 
     # --- Extract matched bands and compute all pairwise ND indices ---
     src_band_arrays = extract_band_arrays(src_clip, [i for i, _ in matched_band_pairs])
@@ -514,6 +625,53 @@ for source_filepath in source_files:
     scale_y = src_clip.shape[1] / tgt_clip.shape[1]
     print(f"  Pixel scale ratio (source/target) — X: {scale_x:.4f}, Y: {scale_y:.4f}")
 
+    # Blur kernel sizes scaled to approximate the same real-world ground
+    # footprint in each image, regardless of its pixel resolution.
+    src_res_x = abs(src_clip.rio.transform().a)
+    tgt_res_x = abs(tgt_clip.rio.transform().a)
+    src_blur_kernel = resolution_scaled_kernel_size(
+        blur_kernel_base_size, blur_kernel_reference_resolution, src_res_x
+    )
+    tgt_blur_kernel = resolution_scaled_kernel_size(
+        blur_kernel_base_size, blur_kernel_reference_resolution, tgt_res_x
+    )
+    print(f"  Blur kernel size — source: {src_blur_kernel}px, target: {tgt_blur_kernel}px")
+
+    # --- Build RGB display composites for the diagnostic plots below ---
+    # Independent of the ND-index channels used for matching: these show the
+    # actual selected bands (display_bands, default the first three source
+    # bands) so plots are visually interpretable. Raw band values from
+    # different sensors can have very different native ranges (e.g.
+    # PlanetScope surface reflectance vs. NAIP 8-bit DN), so before display
+    # each source channel is rescaled onto the target's radiometric scale
+    # using the before-alignment OLS fit (target ~= scale*source + intercept,
+    # from compute_band_metrics_matched_resolution above) and the two are
+    # then jointly normalized — this is only a display transform and is
+    # never applied to the registered GeoTIFF output. Falls back to
+    # independent per-image normalization if the fit is unavailable (e.g.
+    # too few valid samples). Built here (rather than later, next to the
+    # plotting code) because src_clip / tgt_clip are freed before plotting
+    # to bound memory; capped immediately to a bounded resolution for the
+    # same reason.
+    _src_display_channels, _tgt_display_channels = [], []
+    for _b, _t in zip(display_bands, display_target_bands):
+        _s_arr = src_clip.isel(band=_b).values.astype(np.float32)
+        _t_arr = tgt_clip.isel(band=_t).values.astype(np.float32)
+        _b_scale, _b_intercept = _scaleb[_b], _interceptb[_b]
+        if np.isfinite(_b_scale) and np.isfinite(_b_intercept):
+            _s_norm, _t_norm = normalize_pair(_b_scale * _s_arr + _b_intercept, _t_arr)
+        else:
+            _s_norm, _t_norm = normalize_single(_s_arr), normalize_single(_t_arr)
+        _src_display_channels.append(to_uint8(_s_norm))
+        _tgt_display_channels.append(to_uint8(_t_norm))
+    src_display_rgb, src_display_scale = cap_for_sift(
+        np.stack(_src_display_channels, axis=-1), max_sift_dimension
+    )
+    tgt_display_rgb, tgt_display_scale = cap_for_sift(
+        np.stack(_tgt_display_channels, axis=-1), max_sift_dimension
+    )
+    del _src_display_channels, _tgt_display_channels
+
     # --- Feature matching across all ND index channels ---
     all_src_pts = []
     all_tgt_pts = []
@@ -522,8 +680,8 @@ for source_filepath in source_files:
 
     for idx_name in src_nd:
         src_norm, tgt_norm = normalize_pair(src_nd[idx_name], tgt_nd[idx_name])
-        src_u8 = cv2.GaussianBlur(to_uint8(src_norm), blur_kernel_size, 0)
-        tgt_u8 = cv2.GaussianBlur(to_uint8(tgt_norm), blur_kernel_size, 0)
+        src_u8 = cv2.GaussianBlur(to_uint8(src_norm), (src_blur_kernel, src_blur_kernel), 0)
+        tgt_u8 = cv2.GaussianBlur(to_uint8(tgt_norm), (tgt_blur_kernel, tgt_blur_kernel), 0)
 
         # Cap the working resolution for SIFT/FLANN — a fine-resolution target
         # clip can be tens of megapixels, which is impractical to run SIFT's
@@ -792,12 +950,14 @@ for source_filepath in source_files:
     # target's exact grid (over the overlap only, one band at a time) for a
     # fair pixel comparison.
     _warped_clip = source_registered.rio.clip_box(minx=left, miny=bottom, maxx=right, maxy=top)
-    _r2a, _rmsea = compute_band_metrics_matched_resolution(
-        _warped_clip, tgt_clip, matched_band_pairs, resampling_method, rng
+    _r2a, _rmsea, _scalea, _intercepta = compute_band_metrics_matched_resolution(
+        _warped_clip, tgt_clip, matched_band_pairs, rng
     )
     for src_idx, _ in matched_band_pairs:
-        metrics[f'r2_src{src_idx}_after']   = _r2a[src_idx]
-        metrics[f'rmse_src{src_idx}_after'] = _rmsea[src_idx]
+        metrics[f'r2_src{src_idx}_after']        = _r2a[src_idx]
+        metrics[f'rmse_src{src_idx}_after']      = _rmsea[src_idx]
+        metrics[f'scale_src{src_idx}_after']     = _scalea[src_idx]
+        metrics[f'intercept_src{src_idx}_after'] = _intercepta[src_idx]
 
     write_alignment_metrics(
         alignment_metrics_filepath, metric_keys, source_filename, target_filename, inlier_count,
@@ -812,64 +972,71 @@ for source_filepath in source_files:
          inlier_tgt_pts_clip, inlier_src_pts_clip)
     gc.collect()
 
-    # --- Diagnostic plot: falsecolor index comparison in the overlap region ---
-    # Uses up to the first three available ND-index channels; if fewer than
-    # three are available (small band_map), channels are repeated to fill
-    # the RGB composite.
-    _available_channels = sorted(src_nd.keys())
-    display_channels = (_available_channels * 3)[:3]
-    # Cap each channel to a bounded resolution before stacking — a
-    # fine-resolution target clip can be tens of megapixels per channel.
-    src_rgb = np.stack(
-        [cap_for_sift(to_uint8(normalize_pair(src_nd[ch], tgt_nd[ch])[0]), max_sift_dimension)[0]
-         for ch in display_channels],
-        axis=-1
-    )
-    tgt_rgb = np.stack(
-        [cap_for_sift(to_uint8(normalize_pair(src_nd[ch], tgt_nd[ch])[1]), max_sift_dimension)[0]
-         for ch in display_channels],
-        axis=-1
-    )
-
+    # --- Diagnostic plot: band composite comparison in the overlap region ---
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
-    ax1.set_title(f'Source — Index Falsecolor (overlap)\n{source_filename}')
-    ax1.imshow(src_rgb)
-    ax2.set_title(f'Target — Index Falsecolor (overlap)\n{os.path.basename(target_filepath)}')
-    ax2.imshow(tgt_rgb)
+    ax1.set_title(f'Source — Band Composite (overlap)\n{source_filename}')
+    ax1.imshow(src_display_rgb)
+    ax2.set_title(f'Target — Band Composite (overlap)\n{os.path.basename(target_filepath)}')
+    ax2.imshow(tgt_display_rgb)
     fig.tight_layout()
     fig.savefig(
         os.path.join(
             output_directory, "output_plots",
-            source_filename.replace('.tif', '_index_comparison.png')
+            source_filename.replace('.tif', '_band_comparison.png')
         )
     )
     plt.close(fig)
 
+    # --- Diagnostic plot: all Lowe-threshold matches (before RANSAC) ---
+    # Point coordinates (true clip-pixel space) are rescaled into the
+    # (possibly downsampled) display-composite image space.
+    _all_src_pts_arr = np.float32(all_src_pts)
+    _all_tgt_pts_arr = np.float32(all_tgt_pts)
+    if len(_all_src_pts_arr) > max_lowe_match_display_points:
+        _lowe_idx = rng.choice(len(_all_src_pts_arr), max_lowe_match_display_points, replace=False)
+        _lowe_src_pts = _all_src_pts_arr[_lowe_idx]
+        _lowe_tgt_pts = _all_tgt_pts_arr[_lowe_idx]
+    else:
+        _lowe_src_pts = _all_src_pts_arr
+        _lowe_tgt_pts = _all_tgt_pts_arr
+    _lowe_src_pts_disp = _lowe_src_pts * src_display_scale
+    _lowe_tgt_pts_disp = _lowe_tgt_pts * tgt_display_scale
+
+    fig_lowe, (ax_lowe_src, ax_lowe_tgt) = plt.subplots(1, 2, figsize=(14, 6))
+    ax_lowe_src.set_title(
+        f'Source — Lowe-threshold matches ({len(all_src_pts)} total, {len(_lowe_src_pts)} shown)'
+    )
+    ax_lowe_src.imshow(src_display_rgb)
+    if len(_lowe_src_pts_disp):
+        ax_lowe_src.scatter(_lowe_src_pts_disp[:, 0], _lowe_src_pts_disp[:, 1],
+                             s=6, c='yellow', linewidths=0)
+    ax_lowe_tgt.set_title('Target — Lowe-threshold matches')
+    ax_lowe_tgt.imshow(tgt_display_rgb)
+    if len(_lowe_tgt_pts_disp):
+        ax_lowe_tgt.scatter(_lowe_tgt_pts_disp[:, 0], _lowe_tgt_pts_disp[:, 1],
+                             s=6, c='yellow', linewidths=0)
+    fig_lowe.tight_layout()
+    fig_lowe.savefig(
+        os.path.join(
+            output_directory, "output_plots",
+            source_filename.replace('.tif', '_lowe_matches.png')
+        )
+    )
+    plt.close(fig_lowe)
+    del _all_src_pts_arr, _all_tgt_pts_arr, _lowe_src_pts, _lowe_tgt_pts, _lowe_src_pts_disp, _lowe_tgt_pts_disp
+
     # --- Diagnostic plot: RANSAC inlier keypoints ---
     inlier_mask = (mask.ravel() == 1) if mask is not None else np.ones(len(all_src_pts), dtype=bool)
-    inlier_src = np.float32(all_src_pts)[inlier_mask]
-    inlier_tgt = np.float32(all_tgt_pts)[inlier_mask]
-
-    _primary_channel = _available_channels[0]
-    src_idx_u8, tgt_idx_u8 = [
-        to_uint8(n) for n in normalize_pair(src_nd[_primary_channel], tgt_nd[_primary_channel])
-    ]
-    # Cap plot images to a bounded resolution — a fine-resolution target clip
-    # can be tens of megapixels, which is unnecessarily expensive to rasterize
-    # for a diagnostic PNG. Inlier point coordinates (in true clip-pixel
-    # space) are rescaled into this same, possibly smaller, image space.
-    src_idx_u8, _src_disp_scale = cap_for_sift(src_idx_u8, max_sift_dimension)
-    tgt_idx_u8, _tgt_disp_scale = cap_for_sift(tgt_idx_u8, max_sift_dimension)
-    inlier_src = inlier_src * _src_disp_scale
-    inlier_tgt = inlier_tgt * _tgt_disp_scale
+    inlier_src = np.float32(all_src_pts)[inlier_mask] * src_display_scale
+    inlier_tgt = np.float32(all_tgt_pts)[inlier_mask] * tgt_display_scale
 
     fig2, (ax3, ax4) = plt.subplots(1, 2, figsize=(14, 6))
-    ax3.set_title(f'Source ND index {_primary_channel} — RANSAC inliers ({inlier_count})')
-    ax3.imshow(src_idx_u8, cmap='gray', vmin=0, vmax=255)
+    ax3.set_title(f'Source — RANSAC inliers ({inlier_count})')
+    ax3.imshow(src_display_rgb)
     if len(inlier_src):
         ax3.scatter(inlier_src[:, 0], inlier_src[:, 1], s=10, c='red', linewidths=0.5)
-    ax4.set_title(f'Target ND index {_primary_channel} — RANSAC inliers')
-    ax4.imshow(tgt_idx_u8, cmap='gray', vmin=0, vmax=255)
+    ax4.set_title('Target — RANSAC inliers')
+    ax4.imshow(tgt_display_rgb)
     if len(inlier_tgt):
         ax4.scatter(inlier_tgt[:, 0], inlier_tgt[:, 1], s=10, c='cyan', linewidths=0.5)
     fig2.tight_layout()
@@ -882,24 +1049,27 @@ for source_filepath in source_files:
     plt.close(fig2)
 
     # --- Diagnostic plot: correspondence lines between inlier matched pairs ---
-    max_display_h = 600
-    src_h_clip, src_w_clip = src_idx_u8.shape
-    tgt_h_clip, tgt_w_clip = tgt_idx_u8.shape
-    scale = min(1.0, max_display_h / max(src_h_clip, tgt_h_clip))
+    # Source and target panels are independently rescaled to the same
+    # display height so they are easy to visually compare side by side.
+    target_display_h = 600
+    src_h_clip, src_w_clip = src_display_rgb.shape[:2]
+    tgt_h_clip, tgt_w_clip = tgt_display_rgb.shape[:2]
+    corr_scale_src = target_display_h / src_h_clip
+    corr_scale_tgt = target_display_h / tgt_h_clip
 
     def resize_display(arr, s):
-        return cv2.resize(arr, (max(1, int(arr.shape[1] * s)), max(1, int(arr.shape[0] * s))),
+        return cv2.resize(arr, (max(1, int(round(arr.shape[1] * s))), max(1, int(round(arr.shape[0] * s)))),
                           interpolation=cv2.INTER_AREA)
 
-    src_disp = resize_display(src_idx_u8, scale)
-    tgt_disp = resize_display(tgt_idx_u8, scale)
+    src_disp = resize_display(src_display_rgb, corr_scale_src)
+    tgt_disp = resize_display(tgt_display_rgb, corr_scale_tgt)
 
-    disp_src_h, disp_src_w = src_disp.shape
-    disp_tgt_h, disp_tgt_w = tgt_disp.shape
+    disp_src_h, disp_src_w = src_disp.shape[:2]
+    disp_tgt_h, disp_tgt_w = tgt_disp.shape[:2]
     canvas_h = max(disp_src_h, disp_tgt_h)
     canvas_w = disp_src_w + disp_tgt_w
 
-    canvas = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
+    canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
     canvas[:disp_src_h, :disp_src_w] = src_disp
     canvas[:disp_tgt_h, disp_src_w:disp_src_w + disp_tgt_w] = tgt_disp
 
@@ -917,22 +1087,22 @@ for source_filepath in source_files:
         f' ({len(plot_src_pts)} shown)\n'
         f'Source: {source_filename}  |  Target: {target_filename}'
     )
-    ax5.imshow(canvas, cmap='gray', vmin=0, vmax=255)
+    ax5.imshow(canvas)
     ax5.axvline(x=disp_src_w, color='white', linewidth=1, linestyle='--')
 
     for sp, tp in zip(plot_src_pts, plot_tgt_pts):
         ax5.plot(
-            [sp[0] * scale, tp[0] * scale + disp_src_w],
-            [sp[1] * scale, tp[1] * scale],
+            [sp[0] * corr_scale_src, tp[0] * corr_scale_tgt + disp_src_w],
+            [sp[1] * corr_scale_src, tp[1] * corr_scale_tgt],
             color='lime', linewidth=0.5, alpha=0.6
         )
     if len(plot_src_pts):
-        ax5.scatter(plot_src_pts[:, 0] * scale, plot_src_pts[:, 1] * scale,
+        ax5.scatter(plot_src_pts[:, 0] * corr_scale_src, plot_src_pts[:, 1] * corr_scale_src,
                     s=6, c='red', zorder=5, linewidths=0)
-        ax5.scatter(plot_tgt_pts[:, 0] * scale + disp_src_w, plot_tgt_pts[:, 1] * scale,
+        ax5.scatter(plot_tgt_pts[:, 0] * corr_scale_tgt + disp_src_w, plot_tgt_pts[:, 1] * corr_scale_tgt,
                     s=6, c='cyan', zorder=5, linewidths=0)
 
-    ax5.set_xlabel('← Source ND index clip          Target ND index clip →')
+    ax5.set_xlabel('← Source clip          Target clip →')
     ax5.axis('off')
     fig3.tight_layout()
     fig3.savefig(
@@ -945,7 +1115,8 @@ for source_filepath in source_files:
     plt.close(fig3)
 
     # --- Final memory cleanup before next iteration ---
-    del source_image, source_native, src_nd, tgt_nd, all_src_pts, all_tgt_pts, inlier_src, inlier_tgt
+    del (source_image, source_native, src_nd, tgt_nd, all_src_pts, all_tgt_pts,
+         inlier_src, inlier_tgt, src_display_rgb, tgt_display_rgb)
     gc.collect()
 
 print("\nDone.")
