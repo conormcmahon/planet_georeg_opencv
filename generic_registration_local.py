@@ -39,7 +39,9 @@ Outputs (written under output_directory):
                             resolution (reprojected into the target's CRS).
     output_plots/         - diagnostic PNGs per source file: a band-composite
                             comparison, all Lowe-threshold matches, RANSAC
-                            inlier keypoints, and inlier correspondence lines.
+                            inlier keypoints, inlier correspondence lines,
+                            and (before/after) per-band spatial inlier/
+                            outlier masks for the rescaling regression.
     alignment_metrics/    - a CSV log with one row per source file, giving
                             match counts and, per band, R^2, RMSE, and the
                             RANSAC regression scale/intercept (source ~=
@@ -95,6 +97,8 @@ import numpy as np
 import cv2
 import matplotlib
 import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
+from matplotlib.patches import Patch
 import os
 import glob
 import gc
@@ -348,7 +352,7 @@ def ransac_linear_fit(x, y, threshold, rng, n_iterations=200, min_inliers=2):
 def compute_band_metrics_matched_resolution(src_clip, tgt_clip, matched_pairs, rng,
                                               max_sample_points=200_000,
                                               ransac_iterations=200,
-                                              ransac_threshold_frac=0.1):
+                                              ransac_threshold_frac=0.2):
     """
     Estimate per-band agreement between src_clip and tgt_clip, robust to
     outlier pixels (e.g. real land-cover change between acquisition dates,
@@ -378,10 +382,18 @@ def compute_band_metrics_matched_resolution(src_clip, tgt_clip, matched_pairs, r
     using the full sample (plain OLS, no outlier rejection) — plus the
     fraction of the full sample classified as inliers.
 
+    Also records, per band, the spatial sample locations and their inlier/
+    outlier classification (mask_rows, mask_cols, mask_inlier — pixel row/
+    col in the coarser image's clip grid, and a matching bool array), so
+    callers can render a spatial inlier/outlier mask.
+
     Returns a dict of dicts, each keyed by source band index:
         {'r2_inliers', 'r2_all', 'rmse_inliers', 'rmse_all',
          'scale_inliers', 'scale_all', 'intercept_inliers', 'intercept_all',
-         'inlier_frac'}
+         'inlier_frac', 'mask_rows', 'mask_cols', 'mask_inlier'}
+    plus two call-level (not per-band) keys: 'coarse_shape' (the (h, w) of
+    the grid mask_rows/mask_cols are expressed in) and 'coarse_is_source'
+    (whether that grid is src_clip's, as opposed to tgt_clip's).
     """
     src_transform = src_clip.rio.transform()
     tgt_transform = tgt_clip.rio.transform()
@@ -407,10 +419,16 @@ def compute_band_metrics_matched_resolution(src_clip, tgt_clip, matched_pairs, r
                   'scale_inliers', 'scale_all', 'intercept_inliers', 'intercept_all',
                   'inlier_frac')
     out = {name: {} for name in stat_names}
+    out['mask_rows'], out['mask_cols'], out['mask_inlier'] = {}, {}, {}
+    out['coarse_shape'] = coarse_clip.shape[1:]
+    out['coarse_is_source'] = not src_is_finer
 
     def _set_nan(src_idx):
         for name in stat_names:
             out[name][src_idx] = np.nan
+        out['mask_rows'][src_idx] = np.array([], dtype=np.int64)
+        out['mask_cols'][src_idx] = np.array([], dtype=np.int64)
+        out['mask_inlier'][src_idx] = np.array([], dtype=bool)
 
     for src_idx, tgt_idx in matched_pairs:
         fine_idx, coarse_idx = (src_idx, tgt_idx) if src_is_finer else (tgt_idx, src_idx)
@@ -478,6 +496,9 @@ def compute_band_metrics_matched_resolution(src_clip, tgt_clip, matched_pairs, r
         )
         _, _, inlier_mask = ransac_linear_fit(t, s, threshold, rng, n_iterations=ransac_iterations)
         out['inlier_frac'][src_idx] = float(inlier_mask.mean()) if len(inlier_mask) else np.nan
+        out['mask_rows'][src_idx] = rows[valid]
+        out['mask_cols'][src_idx] = cols[valid]
+        out['mask_inlier'][src_idx] = inlier_mask
 
         if inlier_mask.sum() >= 2:
             s_in, t_in = s[inlier_mask], t[inlier_mask]
@@ -584,6 +605,43 @@ def store_band_metrics(metrics, result, matched_pairs, when):
             for subset in ("inliers", "all"):
                 metrics[f"{stat}_src{src_idx}_{when}_{subset}"] = result[f"{stat}_{subset}"][src_idx]
         metrics[f"inlier_frac_src{src_idx}_{when}"] = result["inlier_frac"][src_idx]
+
+
+_RANSAC_MASK_CMAP = ListedColormap(['lightgray', 'red', 'green'])
+_RANSAC_MASK_LEGEND = [
+    Patch(color='lightgray', label='not sampled'),
+    Patch(color='red', label='outlier'),
+    Patch(color='green', label='inlier'),
+]
+
+
+def plot_ransac_mask_grid(result, matched_pairs, when, source_filename, out_path):
+    """
+    Save a PNG with one subplot per matched band, each a binary spatial mask
+    of which sampled pixels were RANSAC inliers vs. outliers for the
+    source ~= scale*target + intercept rescaling model (see
+    compute_band_metrics_matched_resolution). Pixels that weren't part of
+    the sample are shown as "not sampled" rather than left blank.
+    """
+    n = len(matched_pairs)
+    fig, axes = plt.subplots(1, n, figsize=(5 * n, 5.5), squeeze=False)
+    coarse_shape = result['coarse_shape']
+    for ax, (src_idx, _) in zip(axes[0], matched_pairs):
+        mask_img = np.full(coarse_shape, -1, dtype=np.int8)
+        rows, cols = result['mask_rows'][src_idx], result['mask_cols'][src_idx]
+        if len(rows):
+            mask_img[rows, cols] = result['mask_inlier'][src_idx].astype(np.int8)
+        frac = result['inlier_frac'][src_idx]
+        frac_str = f"{frac:.1%}" if np.isfinite(frac) else "n/a"
+        ax.imshow(mask_img + 1, cmap=_RANSAC_MASK_CMAP, vmin=0, vmax=2, interpolation='nearest')
+        ax.set_title(f'Band {src_idx} — inliers: {frac_str}')
+        ax.axis('off')
+    grid_space = 'source' if result['coarse_is_source'] else 'target'
+    fig.suptitle(f'RANSAC rescaling model — {when} alignment ({grid_space}-clip pixel space)\n{source_filename}')
+    fig.legend(handles=_RANSAC_MASK_LEGEND, loc='lower center', ncol=3)
+    fig.tight_layout(rect=[0, 0.06, 1, 0.94])
+    fig.savefig(out_path)
+    plt.close(fig)
 
 
 def write_alignment_metrics(filepath, metric_keys, source_filename, target_filename,
@@ -740,6 +798,11 @@ for source_filepath in source_files:
         src_clip, tgt_clip, matched_band_pairs, rng
     )
     store_band_metrics(metrics, _metrics_before, matched_band_pairs, "before")
+    plot_ransac_mask_grid(
+        _metrics_before, matched_band_pairs, "before", source_filename,
+        os.path.join(output_directory, "output_plots",
+                      source_filename.replace('.tif', '_ransac_mask_before.png'))
+    )
 
     # --- Extract matched bands and compute all pairwise ND indices ---
     src_band_arrays = extract_band_arrays(src_clip, [i for i, _ in matched_band_pairs])
@@ -1090,6 +1153,11 @@ for source_filepath in source_files:
         _warped_clip, tgt_clip, matched_band_pairs, rng
     )
     store_band_metrics(metrics, _metrics_after, matched_band_pairs, "after")
+    plot_ransac_mask_grid(
+        _metrics_after, matched_band_pairs, "after", source_filename,
+        os.path.join(output_directory, "output_plots",
+                      source_filename.replace('.tif', '_ransac_mask_after.png'))
+    )
 
     write_alignment_metrics(
         alignment_metrics_filepath, metric_keys, source_filename, target_filename, inlier_count,
