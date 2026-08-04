@@ -8,6 +8,23 @@ is intended to register one or more "source" rasters onto a single, trusted
 "target" raster, even when the two come from entirely different sensors
 (e.g. PlanetScope source registered onto a NAIP target).
 
+Matching happens in two sequential steps per source file:
+    Step 1 (coarse): SIFT keypoints/descriptors are detected per ND-index
+        channel and matched with an unguided FLANN k=2 + Lowe-ratio-test +
+        loose pixel-distance search, then RANSAC fits a coarse affine
+        transform. This step produces no output raster — it exists only to
+        seed step 2.
+    Step 2 (guided): the SAME per-channel keypoints/descriptors from step 1
+        are re-matched via guided_match_per_descriptor_radius, which builds
+        a KD-tree over predicted target positions and, per target
+        descriptor, restricts candidates to source keypoints within
+        keypoint_match_distance_threshold pixels of where step 1's coarse
+        affine predicts a given source keypoint should fall — geometry is
+        filtered first, and descriptor similarity (Lowe's ratio test) is
+        only checked within that surviving geometric neighborhood. RANSAC,
+        the TPS warp, and the final registered output are all built from
+        this refined match set.
+
 Inputs (see "Settings" section below):
     source_directory  - directory containing one or more source *.tif rasters
                          to be registered onto the target.
@@ -106,6 +123,7 @@ from itertools import combinations
 from rasterio.enums import Resampling
 from scipy.interpolate import RBFInterpolator
 from scipy.ndimage import map_coordinates, uniform_filter
+from scipy.spatial import cKDTree
 
 # --- Settings ---
 min_pixel_count = 1000        # minimum valid pixels in overlap region to attempt registration
@@ -114,6 +132,18 @@ lowe_ratio_threshold = 1000   # Lowe's ratio test threshold
 distance_threshold_pixels = 50  # max allowed pixel-space distance between matched keypoints
                                  # (evaluated in source clip-pixel units; see scale_x/scale_y below)
 ransac_reproj_threshold = 2.0   # RANSAC reprojection error threshold (source clip pixels)
+
+# --- Step 2: guided re-matching settings ---
+# Step 1 detects keypoints/descriptors and does an unguided match to get a
+# coarse affine transform (no output raster is written from step 1). Step 2
+# reuses those same keypoints/descriptors and re-matches them via
+# guided_match_per_descriptor_radius: a KD-tree spatial query restricts each
+# target descriptor's candidates to source keypoints within
+# keypoint_match_distance_threshold pixels (in target clip-pixel space) of
+# where step 1's coarse affine predicts they should fall, BEFORE any
+# descriptor-similarity comparison; this refined match set is what RANSAC,
+# the TPS warp, and the final registered output are built from.
+keypoint_match_distance_threshold = 15  # pixels, target clip-pixel space
 
 # Gaussian blur kernel applied before SIFT, expressed as a pixel size at
 # blur_kernel_reference_resolution (real-world units matching the target/
@@ -586,6 +616,53 @@ def spatially_thin_keypoints(tgt_pts, src_pts, max_control_points, clip_w, clip_
     return tgt_pts[kept], src_pts[kept]
 
 
+def keypoints_to_true_pixels(kp_list, sift_scale):
+    """Convert SIFT keypoints (in detection-image pixels) to true clip-pixel coordinates."""
+    if len(kp_list) == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    return np.float32([kp.pt for kp in kp_list]) / sift_scale
+
+
+def guided_match_per_descriptor_radius(src_kp, src_desc, tgt_kp, tgt_desc, src_sift_scale, tgt_sift_scale,
+                                        M_inv, distance_threshold, lowe_ratio_threshold):
+    """
+    Step-2 guided matching, approach 2: build a KD-tree over each source
+    keypoint's step-1-predicted target position (M_inv applied to it), then
+    for each target descriptor individually, query the tree for source
+    keypoints predicted to fall within distance_threshold pixels and compare
+    descriptor distances only within that geometric subset. Lowe's ratio
+    test is applied to the two closest descriptors in the subset; a subset
+    of size 1 is accepted without a ratio test.
+
+    Returns (src_pts, tgt_pts): lists of matched (x, y) pairs in true
+    clip-pixel coordinates.
+    """
+    src_pts_true = keypoints_to_true_pixels(src_kp, src_sift_scale)
+    tgt_pts_true = keypoints_to_true_pixels(tgt_kp, tgt_sift_scale)
+    pred_tgt_pts = cv2.transform(src_pts_true.reshape(-1, 1, 2), M_inv).reshape(-1, 2)
+
+    tree = cKDTree(pred_tgt_pts)
+
+    out_src_pts, out_tgt_pts = [], []
+    for tgt_i in range(len(tgt_kp)):
+        tgt_pt = tgt_pts_true[tgt_i]
+        candidate_idx = tree.query_ball_point(tgt_pt, r=distance_threshold)
+        if not candidate_idx:
+            continue
+        cand_desc = src_desc[candidate_idx]
+        dists = np.linalg.norm(cand_desc - tgt_desc[tgt_i][None, :], axis=1)
+        order = np.argsort(dists)
+        if len(order) == 1:
+            best_src_idx = candidate_idx[order[0]]
+        else:
+            if dists[order[0]] >= lowe_ratio_threshold * dists[order[1]]:
+                continue
+            best_src_idx = candidate_idx[order[0]]
+        out_src_pts.append((float(src_pts_true[best_src_idx][0]), float(src_pts_true[best_src_idx][1])))
+        out_tgt_pts.append((float(tgt_pt[0]), float(tgt_pt[1])))
+    return out_src_pts, out_tgt_pts
+
+
 def build_metric_keys(matched_pairs):
     keys = []
     for when in ("before", "after"):
@@ -871,11 +948,17 @@ for source_filepath in source_files:
     )
     del _src_display_channels, _tgt_display_channels
 
-    # --- Feature matching across all ND index channels ---
+    # =========================================================================
+    # Step 1: coarse matching. Detect SIFT keypoints/descriptors per ND-index
+    # channel and do an unguided match to obtain a coarse affine transform.
+    # This step never produces output raster imagery — its only purpose is
+    # to seed step 2's geometrically-guided re-matching below.
+    # =========================================================================
     all_src_pts = []
     all_tgt_pts = []
     total_raw_matches = 0
     channel_match_counts = {}
+    channel_features = []  # (idx_name, src_kp, src_desc, tgt_kp, tgt_desc, src_sift_scale, tgt_sift_scale)
 
     for idx_name in src_nd:
         src_norm, tgt_norm = normalize_pair(src_nd[idx_name], tgt_nd[idx_name])
@@ -896,6 +979,12 @@ for source_filepath in source_files:
                 len(src_kp) < min_keypoints or len(tgt_kp) < min_keypoints):
             channel_match_counts[idx_name] = 0
             continue
+
+        # Kept for step 2, which re-matches these same keypoints/descriptors
+        # rather than re-running SIFT.
+        channel_features.append(
+            (idx_name, src_kp, src_desc, tgt_kp, tgt_desc, src_sift_scale, tgt_sift_scale)
+        )
 
         flann = cv2.FlannBasedMatcher(flann_index_params, flann_search_params)
         raw_matches = flann.knnMatch(tgt_desc, src_desc, k=2)
@@ -928,18 +1017,75 @@ for source_filepath in source_files:
 
         channel_match_counts[idx_name] = channel_good
 
-    print(f"  Per-channel good matches: {channel_match_counts}")
-    print(f"  Total — raw: {total_raw_matches}, after filtering: {len(all_src_pts)}")
+    print(f"  [Step 1] Per-channel good matches: {channel_match_counts}")
+    print(f"  [Step 1] Total — raw: {total_raw_matches}, after filtering: {len(all_src_pts)}")
 
     if len(all_src_pts) < 4:
-        print("  Not enough good matches for RANSAC. Skipping.")
+        print("  [Step 1] Not enough good matches for a coarse transform. Skipping.")
         write_alignment_metrics(
             alignment_metrics_filepath, metric_keys, source_filename, target_filename, 0,
             len(all_src_pts), total_raw_matches, metrics
         )
         continue
 
-    # --- Estimate affine transform with RANSAC ---
+    tgt_pts_arr = np.float32(all_tgt_pts).reshape(-1, 1, 2)
+    src_pts_arr = np.float32(all_src_pts).reshape(-1, 1, 2)
+
+    M_coarse, mask_coarse = cv2.estimateAffine2D(
+        tgt_pts_arr, src_pts_arr,
+        method=cv2.RANSAC,
+        ransacReprojThreshold=ransac_reproj_threshold
+    )
+
+    if M_coarse is None:
+        print("  [Step 1] RANSAC failed to produce a coarse affine transform. Skipping.")
+        write_alignment_metrics(
+            alignment_metrics_filepath, metric_keys, source_filename, target_filename, 0,
+            len(all_src_pts), total_raw_matches, metrics
+        )
+        continue
+
+    coarse_inlier_count = int(np.sum(mask_coarse)) if mask_coarse is not None else 0
+    print(f"  [Step 1] Coarse RANSAC inliers: {coarse_inlier_count} / {len(all_src_pts)}")
+
+    # =========================================================================
+    # Step 2: guided re-matching. Reuse step 1's per-channel keypoints and
+    # descriptors (no re-detection), restricting candidate matches to those
+    # within keypoint_match_distance_threshold pixels of where step 1's
+    # coarse affine predicts a given source keypoint should fall in target
+    # clip-pixel space. This refined match set is what RANSAC, the TPS warp,
+    # and the final registered output are built from.
+    # =========================================================================
+    M_inv = cv2.invertAffineTransform(M_coarse)
+
+    all_src_pts = []
+    all_tgt_pts = []
+    total_raw_matches = 0
+    channel_match_counts = {}
+
+    for idx_name, src_kp, src_desc, tgt_kp, tgt_desc, src_sift_scale, tgt_sift_scale in channel_features:
+        ch_src_pts, ch_tgt_pts = guided_match_per_descriptor_radius(
+            src_kp, src_desc, tgt_kp, tgt_desc, src_sift_scale, tgt_sift_scale,
+            M_inv, keypoint_match_distance_threshold, lowe_ratio_threshold
+        )
+
+        all_src_pts.extend(ch_src_pts)
+        all_tgt_pts.extend(ch_tgt_pts)
+        total_raw_matches += len(tgt_kp)
+        channel_match_counts[idx_name] = len(ch_src_pts)
+
+    print(f"  [Step 2] Per-channel guided matches: {channel_match_counts}")
+    print(f"  [Step 2] Total guided matches: {len(all_src_pts)}")
+
+    if len(all_src_pts) < 4:
+        print("  [Step 2] Not enough guided matches for RANSAC. Skipping.")
+        write_alignment_metrics(
+            alignment_metrics_filepath, metric_keys, source_filename, target_filename, 0,
+            len(all_src_pts), total_raw_matches, metrics
+        )
+        continue
+
+    # --- Estimate refined affine transform with RANSAC ---
     # This gives us an inlier mask for selecting geometrically consistent matches.
     # The affine parameters themselves are only used to compute mean_kp_dist_after;
     # the actual warp uses the TPS displacement field derived from the inliers.
@@ -953,7 +1099,7 @@ for source_filepath in source_files:
     )
 
     if M_part is None:
-        print("  RANSAC failed to produce a valid affine transform. Skipping.")
+        print("  [Step 2] RANSAC failed to produce a valid affine transform. Skipping.")
         write_alignment_metrics(
             alignment_metrics_filepath, metric_keys, source_filename, target_filename, 0,
             len(all_src_pts), total_raw_matches, metrics
@@ -961,7 +1107,7 @@ for source_filepath in source_files:
         continue
 
     inlier_count = int(np.sum(mask)) if mask is not None else 0
-    print(f"  RANSAC inliers: {inlier_count} / {len(all_src_pts)}")
+    print(f"  [Step 2] Refined RANSAC inliers: {inlier_count} / {len(all_src_pts)}")
 
     # --- Keypoint distances before/after (using the RANSAC affine as reference) ---
     _inlier_bool = (mask.ravel() == 1) if mask is not None else np.zeros(len(all_src_pts), bool)
@@ -980,7 +1126,7 @@ for source_filepath in source_files:
         )
 
     if inlier_count < 4:
-        print("  Too few RANSAC inliers. Skipping.")
+        print("  [Step 2] Too few RANSAC inliers. Skipping.")
         write_alignment_metrics(
             alignment_metrics_filepath, metric_keys, source_filename, target_filename, inlier_count,
             len(all_src_pts), total_raw_matches, metrics
@@ -1187,7 +1333,7 @@ for source_filepath in source_files:
     )
     plt.close(fig)
 
-    # --- Diagnostic plot: all Lowe-threshold matches (before RANSAC) ---
+    # --- Diagnostic plot: all step-2 guided matches (before RANSAC) ---
     # Point coordinates (true clip-pixel space) are rescaled into the
     # (possibly downsampled) display-composite image space.
     _all_src_pts_arr = np.float32(all_src_pts)
@@ -1204,13 +1350,13 @@ for source_filepath in source_files:
 
     fig_lowe, (ax_lowe_src, ax_lowe_tgt) = plt.subplots(1, 2, figsize=(14, 6))
     ax_lowe_src.set_title(
-        f'Source — Lowe-threshold matches ({len(all_src_pts)} total, {len(_lowe_src_pts)} shown)'
+        f'Source — step-2 guided matches ({len(all_src_pts)} total, {len(_lowe_src_pts)} shown)'
     )
     ax_lowe_src.imshow(src_display_rgb)
     if len(_lowe_src_pts_disp):
         ax_lowe_src.scatter(_lowe_src_pts_disp[:, 0], _lowe_src_pts_disp[:, 1],
                              s=6, c='yellow', linewidths=0)
-    ax_lowe_tgt.set_title('Target — Lowe-threshold matches')
+    ax_lowe_tgt.set_title('Target — step-2 guided matches')
     ax_lowe_tgt.imshow(tgt_display_rgb)
     if len(_lowe_tgt_pts_disp):
         ax_lowe_tgt.scatter(_lowe_tgt_pts_disp[:, 0], _lowe_tgt_pts_disp[:, 1],
@@ -1316,7 +1462,7 @@ for source_filepath in source_files:
 
     # --- Final memory cleanup before next iteration ---
     del (source_image, source_native, src_nd, tgt_nd, all_src_pts, all_tgt_pts,
-         inlier_src, inlier_tgt, src_display_rgb, tgt_display_rgb)
+         inlier_src, inlier_tgt, src_display_rgb, tgt_display_rgb, channel_features)
     gc.collect()
 
 print("\nDone.")
