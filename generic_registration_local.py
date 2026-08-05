@@ -165,6 +165,21 @@ keypoint_match_distance_threshold_m = 15.0  # meters, real-world ground distance
 blur_kernel_base_size = 3
 blur_kernel_reference_resolution = 3.0
 
+# Nodata/cloud-mask handling before SIFT:
+# Each ND-index channel's own valid-pixel mask (wherever neither contributing
+# band is NaN) is used two ways: (1) the pre-SIFT Gaussian blur is a masked/
+# normalized convolution (blur(data*mask)/blur(mask)) so invalid pixels never
+# bleed a false zero-value edge into nearby valid pixels the way a plain blur
+# of a NaN-to-zero-filled image would; (2) the mask is eroded by
+# mask_erosion_blur_multiple * that image's own blur kernel size and passed
+# to SIFT's detectAndCompute mask argument, so keypoints (and their
+# descriptor support window) are never placed inside or near a hole or scene
+# edge in the first place. The margin scales with the blur kernel (itself
+# already scaled to a fixed real-world footprint) so it stays proportionate
+# across resolutions. Larger values are more conservative (fewer keypoints
+# survive near holes/edges).
+mask_erosion_blur_multiple = 2
+
 max_sift_dimension = 4000     # cap each ND-index channel's larger side before SIFT; clips
                                # larger than this (e.g. a high-resolution target) are downsampled
                                # for detection only, and matched keypoint coordinates are rescaled
@@ -312,7 +327,7 @@ def normalize_single(arr, percentile_clip=None):
     return np.clip(out, 0.0, 1.0) if percentile_clip is not None else out
 
 
-def cap_for_sift(img_u8, max_dim):
+def cap_for_sift(img_u8, max_dim, interpolation=cv2.INTER_AREA):
     """
     Downsample img_u8 (if needed) so its larger side is at most max_dim.
     Works on both single-channel (H, W) and multi-channel (H, W, C) images.
@@ -320,6 +335,11 @@ def cap_for_sift(img_u8, max_dim):
     Returns (image_for_detection, scale), where scale = detection_size /
     original_size. Detected keypoint coordinates must be divided by `scale`
     to convert them back to the original image's pixel space.
+
+    Pass interpolation=cv2.INTER_NEAREST when resizing a binary mask
+    alongside its image (via a separate call with the same max_dim, which
+    yields the same scale since it depends only on shape) to keep it
+    strictly 0/255 rather than picking up intermediate averaged values.
     """
     h, w = img_u8.shape[:2]
     scale = min(1.0, max_dim / max(h, w))
@@ -327,7 +347,7 @@ def cap_for_sift(img_u8, max_dim):
         return img_u8, 1.0
     small = cv2.resize(
         img_u8, (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
-        interpolation=cv2.INTER_AREA
+        interpolation=interpolation
     )
     return small, scale
 
@@ -353,6 +373,49 @@ def to_uint8(arr):
     return np.nan_to_num(
         np.round(np.clip(arr * 255, 0, 255)), nan=0.0
     ).astype(np.uint8)
+
+
+def masked_gaussian_blur(img_u8, valid_mask, ksize):
+    """
+    Gaussian-blur img_u8 using normalized convolution — blur(data*mask) /
+    blur(mask) — so that invalid (valid_mask == False) pixels never bleed
+    their arbitrary zero-filled value into neighboring valid pixels.
+
+    A plain blur of a NaN-to-zero-filled image creates a false, artificially
+    dark edge around every nodata/cloud-mask hole and scene boundary, which
+    SIFT tends to lock onto as if it were real texture. This keeps blurred
+    values at the edge of a hole a legitimate average of only the nearby
+    valid pixels. Pixels with no valid support in their blur footprint
+    (blurred mask ~ 0, i.e. deep inside a large hole) fall back to 0 — such
+    pixels are excluded from detection anyway via the eroded mask passed to
+    SIFT separately (see erode_valid_mask).
+    """
+    mask_f = valid_mask.astype(np.float32)
+    data_f = img_u8.astype(np.float32) * mask_f
+    blurred_data = cv2.GaussianBlur(data_f, (ksize, ksize), 0)
+    blurred_mask = cv2.GaussianBlur(mask_f, (ksize, ksize), 0)
+    out = np.divide(
+        blurred_data, blurred_mask,
+        out=np.zeros_like(blurred_data), where=blurred_mask > 1e-6
+    )
+    return np.clip(np.round(out), 0, 255).astype(np.uint8)
+
+
+def erode_valid_mask(valid_mask, margin_px):
+    """
+    Erode a boolean valid-data mask so only pixels at least margin_px away
+    (in the same pixel space) from any nodata/cloud-masked region remain.
+
+    Used to build the mask passed to SIFT's detectAndCompute, keeping
+    keypoints (and their descriptor support window) away from holes and
+    scene edges. Returns a uint8 0/255 mask suitable for cv2's mask
+    parameter.
+    """
+    r = max(0, int(round(margin_px)))
+    if r == 0:
+        return valid_mask.astype(np.uint8) * 255
+    kernel = np.ones((2 * r + 1, 2 * r + 1), np.uint8)
+    return cv2.erode(valid_mask.astype(np.uint8) * 255, kernel)
 
 
 def ransac_linear_fit(x, y, threshold, rng, n_iterations=200, min_inliers=2):
@@ -988,18 +1051,35 @@ for source_filepath in source_files:
 
     for idx_name in src_nd:
         src_norm, tgt_norm = normalize_pair(src_nd[idx_name], tgt_nd[idx_name])
-        src_u8 = cv2.GaussianBlur(to_uint8(src_norm), (src_blur_kernel, src_blur_kernel), 0)
-        tgt_u8 = cv2.GaussianBlur(to_uint8(tgt_norm), (tgt_blur_kernel, tgt_blur_kernel), 0)
+
+        # Per-channel valid-data mask: False wherever either contributing
+        # band (and therefore this ND-index channel) is nodata/cloud-masked.
+        src_valid = ~np.isnan(src_nd[idx_name])
+        tgt_valid = ~np.isnan(tgt_nd[idx_name])
+
+        src_u8 = masked_gaussian_blur(to_uint8(src_norm), src_valid, src_blur_kernel)
+        tgt_u8 = masked_gaussian_blur(to_uint8(tgt_norm), tgt_valid, tgt_blur_kernel)
+
+        # Erode each image's own valid mask by a margin tied to its own blur
+        # kernel size, and pass it to SIFT's mask argument so keypoints (and
+        # their descriptor support window) are never placed inside or near a
+        # nodata/cloud-mask hole or scene edge.
+        src_mask = erode_valid_mask(src_valid, mask_erosion_blur_multiple * src_blur_kernel)
+        tgt_mask = erode_valid_mask(tgt_valid, mask_erosion_blur_multiple * tgt_blur_kernel)
 
         # Cap the working resolution for SIFT/FLANN — a fine-resolution target
         # clip can be tens of megapixels, which is impractical to run SIFT's
         # scale-space pyramid on. Detected keypoints are rescaled back to true
-        # clip-pixel coordinates immediately below.
+        # clip-pixel coordinates immediately below. The mask is downsampled
+        # alongside its image (same shape -> same scale) with nearest-
+        # neighbor interpolation to stay strictly binary.
         src_u8_det, src_sift_scale = cap_for_sift(src_u8, max_sift_dimension)
         tgt_u8_det, tgt_sift_scale = cap_for_sift(tgt_u8, max_sift_dimension)
+        src_mask_det, _ = cap_for_sift(src_mask, max_sift_dimension, interpolation=cv2.INTER_NEAREST)
+        tgt_mask_det, _ = cap_for_sift(tgt_mask, max_sift_dimension, interpolation=cv2.INTER_NEAREST)
 
-        src_kp, src_desc = sift.detectAndCompute(src_u8_det, None)
-        tgt_kp, tgt_desc = sift.detectAndCompute(tgt_u8_det, None)
+        src_kp, src_desc = sift.detectAndCompute(src_u8_det, src_mask_det)
+        tgt_kp, tgt_desc = sift.detectAndCompute(tgt_u8_det, tgt_mask_det)
 
         if (src_desc is None or tgt_desc is None or
                 len(src_kp) < min_keypoints or len(tgt_kp) < min_keypoints):
