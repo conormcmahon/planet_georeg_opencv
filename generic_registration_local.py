@@ -18,8 +18,9 @@ Matching happens in two sequential steps per source file:
         are re-matched via guided_match_per_descriptor_radius, which builds
         a KD-tree over predicted target positions and, per target
         descriptor, restricts candidates to source keypoints within
-        keypoint_match_distance_threshold pixels of where step 1's coarse
-        affine predicts a given source keypoint should fall — geometry is
+        keypoint_match_distance_threshold_m real-world meters (converted to
+        target clip-pixels via that image's own resolution) of where step 1's
+        coarse affine predicts a given source keypoint should fall — geometry is
         filtered first, and descriptor similarity (Lowe's ratio test) is
         only checked within that surviving geometric neighborhood. RANSAC,
         the TPS warp, and the final registered output are all built from
@@ -60,7 +61,12 @@ Outputs (written under output_directory):
                             and (before/after) per-band spatial inlier/
                             outlier masks for the rescaling regression.
     alignment_metrics/    - a CSV log with one row per source file, giving
-                            match counts and, per band, R^2, RMSE, and the
+                            match/inlier counts for both step 1's coarse
+                            global search (num_step1_ransac_inliers,
+                            num_step1_good_matches, num_step1_raw_matches)
+                            and step 2's guided local search
+                            (num_ransac_inliers, num_good_matches,
+                            num_raw_matches), plus, per band, R^2, RMSE, and the
                             RANSAC regression scale/intercept (source ~=
                             scale * target + intercept), each computed twice
                             — once using only RANSAC inliers, once using all
@@ -139,11 +145,15 @@ ransac_reproj_threshold = 2.0   # RANSAC reprojection error threshold (source cl
 # reuses those same keypoints/descriptors and re-matches them via
 # guided_match_per_descriptor_radius: a KD-tree spatial query restricts each
 # target descriptor's candidates to source keypoints within
-# keypoint_match_distance_threshold pixels (in target clip-pixel space) of
-# where step 1's coarse affine predicts they should fall, BEFORE any
-# descriptor-similarity comparison; this refined match set is what RANSAC,
-# the TPS warp, and the final registered output are built from.
-keypoint_match_distance_threshold = 15  # pixels, target clip-pixel space
+# keypoint_match_distance_threshold_m real-world meters of where step 1's
+# coarse affine predicts they should fall, BEFORE any descriptor-similarity
+# comparison; this refined match set is what RANSAC, the TPS warp, and the
+# final registered output are built from. A fixed real-world distance (rather
+# than a fixed pixel count) keeps the guided search radius comparable across
+# source/target pairs with different resolutions; it is converted to target
+# clip-pixel space per-file using that file's own pixel size (tgt_res_x)
+# immediately before step 2 runs.
+keypoint_match_distance_threshold_m = 15.0  # meters, real-world ground distance
 
 # Gaussian blur kernel applied before SIFT, expressed as a pixel size at
 # blur_kernel_reference_resolution (real-world units matching the target/
@@ -722,13 +732,24 @@ def plot_ransac_mask_grid(result, matched_pairs, when, source_filename, out_path
 
 
 def write_alignment_metrics(filepath, metric_keys, source_filename, target_filename,
+                             num_step1_ransac_inliers, num_step1_good_matches, num_step1_raw_matches,
                              num_ransac, num_good, num_raw, metrics=None):
-    """Append one row of local-registration quality metrics to the CSV log."""
+    """
+    Append one row of local-registration quality metrics to the CSV log.
+
+    num_step1_ransac_inliers/num_step1_good_matches/num_step1_raw_matches
+    describe step 1's coarse, unguided global search (RANSAC inliers among
+    the coarse affine fit, Lowe/distance-filtered matches, and raw FLANN
+    matches, respectively); num_ransac/num_good/num_raw describe the same
+    three quantities for step 2's geometrically-guided local search.
+    """
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     if not os.path.exists(filepath):
         with open(filepath, 'w') as f:
             f.write(
-                "source_filename,target_filename,num_ransac_inliers,num_good_matches,num_raw_matches,"
+                "source_filename,target_filename,"
+                "num_step1_ransac_inliers,num_step1_good_matches,num_step1_raw_matches,"
+                "num_ransac_inliers,num_good_matches,num_raw_matches,"
                 + ','.join(metric_keys) + '\n'
             )
     if metrics is None:
@@ -736,7 +757,9 @@ def write_alignment_metrics(filepath, metric_keys, source_filename, target_filen
     with open(filepath, 'a') as f:
         extra_vals = ','.join(str(metrics.get(k, np.nan)) for k in metric_keys)
         f.write(
-            f"{source_filename},{target_filename},{num_ransac},{num_good},{num_raw},{extra_vals}\n"
+            f"{source_filename},{target_filename},"
+            f"{num_step1_ransac_inliers},{num_step1_good_matches},{num_step1_raw_matches},"
+            f"{num_ransac},{num_good},{num_raw},{extra_vals}\n"
         )
 
 
@@ -823,7 +846,8 @@ for source_filepath in source_files:
         print(f"  band_map has {len(band_map)} entries but source has "
               f"{source_image.shape[0]} bands. Skipping.")
         write_alignment_metrics(
-            alignment_metrics_filepath, metric_keys, source_filename, target_filename, 0, 0, 0, metrics
+            alignment_metrics_filepath, metric_keys, source_filename, target_filename,
+            0, 0, 0, 0, 0, 0, metrics
         )
         continue
 
@@ -844,7 +868,8 @@ for source_filepath in source_files:
     if overlap is None:
         print("  No geographic overlap between source and target. Skipping.")
         write_alignment_metrics(
-            alignment_metrics_filepath, metric_keys, source_filename, target_filename, 0, 0, 0, metrics
+            alignment_metrics_filepath, metric_keys, source_filename, target_filename,
+            0, 0, 0, 0, 0, 0, metrics
         )
         continue
 
@@ -862,7 +887,8 @@ for source_filepath in source_files:
     if min(src_valid, tgt_valid) < min_pixel_count:
         print("  Too few valid pixels in overlap. Skipping.")
         write_alignment_metrics(
-            alignment_metrics_filepath, metric_keys, source_filename, target_filename, 0, 0, 0, metrics
+            alignment_metrics_filepath, metric_keys, source_filename, target_filename,
+            0, 0, 0, 0, 0, 0, metrics
         )
         continue
 
@@ -1023,8 +1049,9 @@ for source_filepath in source_files:
     if len(all_src_pts) < 4:
         print("  [Step 1] Not enough good matches for a coarse transform. Skipping.")
         write_alignment_metrics(
-            alignment_metrics_filepath, metric_keys, source_filename, target_filename, 0,
-            len(all_src_pts), total_raw_matches, metrics
+            alignment_metrics_filepath, metric_keys, source_filename, target_filename,
+            0, len(all_src_pts), total_raw_matches,
+            0, 0, 0, metrics
         )
         continue
 
@@ -1040,23 +1067,35 @@ for source_filepath in source_files:
     if M_coarse is None:
         print("  [Step 1] RANSAC failed to produce a coarse affine transform. Skipping.")
         write_alignment_metrics(
-            alignment_metrics_filepath, metric_keys, source_filename, target_filename, 0,
-            len(all_src_pts), total_raw_matches, metrics
+            alignment_metrics_filepath, metric_keys, source_filename, target_filename,
+            0, len(all_src_pts), total_raw_matches,
+            0, 0, 0, metrics
         )
         continue
 
     coarse_inlier_count = int(np.sum(mask_coarse)) if mask_coarse is not None else 0
     print(f"  [Step 1] Coarse RANSAC inliers: {coarse_inlier_count} / {len(all_src_pts)}")
 
+    # Save step 1's (global-search) counts before step 2 reuses these variable
+    # names for its own (local-search) counts below.
+    step1_ransac_inliers = coarse_inlier_count
+    step1_good_matches = len(all_src_pts)
+    step1_raw_matches = total_raw_matches
+
     # =========================================================================
     # Step 2: guided re-matching. Reuse step 1's per-channel keypoints and
     # descriptors (no re-detection), restricting candidate matches to those
-    # within keypoint_match_distance_threshold pixels of where step 1's
-    # coarse affine predicts a given source keypoint should fall in target
-    # clip-pixel space. This refined match set is what RANSAC, the TPS warp,
-    # and the final registered output are built from.
+    # within keypoint_match_distance_threshold_m real-world meters (converted
+    # to target clip-pixels via tgt_res_x) of where step 1's coarse affine
+    # predicts a given source keypoint should fall in target clip-pixel space.
+    # This refined match set is what RANSAC, the TPS warp, and the final
+    # registered output are built from.
     # =========================================================================
     M_inv = cv2.invertAffineTransform(M_coarse)
+
+    keypoint_match_distance_threshold_px = keypoint_match_distance_threshold_m / tgt_res_x
+    print(f"  [Step 2] Guided match distance threshold: "
+          f"{keypoint_match_distance_threshold_m} m -> {keypoint_match_distance_threshold_px:.2f} target px")
 
     all_src_pts = []
     all_tgt_pts = []
@@ -1066,7 +1105,7 @@ for source_filepath in source_files:
     for idx_name, src_kp, src_desc, tgt_kp, tgt_desc, src_sift_scale, tgt_sift_scale in channel_features:
         ch_src_pts, ch_tgt_pts = guided_match_per_descriptor_radius(
             src_kp, src_desc, tgt_kp, tgt_desc, src_sift_scale, tgt_sift_scale,
-            M_inv, keypoint_match_distance_threshold, lowe_ratio_threshold
+            M_inv, keypoint_match_distance_threshold_px, lowe_ratio_threshold
         )
 
         all_src_pts.extend(ch_src_pts)
@@ -1080,8 +1119,9 @@ for source_filepath in source_files:
     if len(all_src_pts) < 4:
         print("  [Step 2] Not enough guided matches for RANSAC. Skipping.")
         write_alignment_metrics(
-            alignment_metrics_filepath, metric_keys, source_filename, target_filename, 0,
-            len(all_src_pts), total_raw_matches, metrics
+            alignment_metrics_filepath, metric_keys, source_filename, target_filename,
+            step1_ransac_inliers, step1_good_matches, step1_raw_matches,
+            0, len(all_src_pts), total_raw_matches, metrics
         )
         continue
 
@@ -1101,8 +1141,9 @@ for source_filepath in source_files:
     if M_part is None:
         print("  [Step 2] RANSAC failed to produce a valid affine transform. Skipping.")
         write_alignment_metrics(
-            alignment_metrics_filepath, metric_keys, source_filename, target_filename, 0,
-            len(all_src_pts), total_raw_matches, metrics
+            alignment_metrics_filepath, metric_keys, source_filename, target_filename,
+            step1_ransac_inliers, step1_good_matches, step1_raw_matches,
+            0, len(all_src_pts), total_raw_matches, metrics
         )
         continue
 
@@ -1128,8 +1169,9 @@ for source_filepath in source_files:
     if inlier_count < 4:
         print("  [Step 2] Too few RANSAC inliers. Skipping.")
         write_alignment_metrics(
-            alignment_metrics_filepath, metric_keys, source_filename, target_filename, inlier_count,
-            len(all_src_pts), total_raw_matches, metrics
+            alignment_metrics_filepath, metric_keys, source_filename, target_filename,
+            step1_ransac_inliers, step1_good_matches, step1_raw_matches,
+            inlier_count, len(all_src_pts), total_raw_matches, metrics
         )
         continue
 
@@ -1306,8 +1348,9 @@ for source_filepath in source_files:
     )
 
     write_alignment_metrics(
-        alignment_metrics_filepath, metric_keys, source_filename, target_filename, inlier_count,
-        len(all_src_pts), total_raw_matches, metrics
+        alignment_metrics_filepath, metric_keys, source_filename, target_filename,
+        step1_ransac_inliers, step1_good_matches, step1_raw_matches,
+        inlier_count, len(all_src_pts), total_raw_matches, metrics
     )
 
     # --- Early memory release before plots ---
