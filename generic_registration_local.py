@@ -327,6 +327,33 @@ def normalize_single(arr, percentile_clip=None):
     return np.clip(out, 0.0, 1.0) if percentile_clip is not None else out
 
 
+def percentile_histogram_match(sample_arr, reference_arr, percentile_clip):
+    """
+    Return (scale, intercept) such that scale*sample_arr + intercept has the
+    same [percentile_clip, 100 - percentile_clip] range as reference_arr.
+
+    Used to visually harmonize source/target band-composite display images
+    of different sensors/units: matching each image's own value distribution
+    (a simple linear histogram match) rather than fitting a regression on
+    spatially-paired pixels means the result needs no pixel-to-pixel
+    correspondence between the two rasters, so it is unaffected by residual
+    misregistration between them — unlike the RANSAC-inlier regression fit
+    used for the alignment_metrics.csv scale/intercept columns, which is
+    calibrated from paired pixels and can be badly biased by exactly that
+    misregistration before alignment.
+
+    Returns (nan, nan) if sample_arr's percentile range is degenerate (e.g.
+    a uniform or all-nodata band).
+    """
+    lo_ref, hi_ref = np.nanpercentile(reference_arr, [percentile_clip, 100 - percentile_clip])
+    lo_smp, hi_smp = np.nanpercentile(sample_arr, [percentile_clip, 100 - percentile_clip])
+    if not (hi_smp > lo_smp):
+        return np.nan, np.nan
+    scale = (hi_ref - lo_ref) / (hi_smp - lo_smp)
+    intercept = lo_ref - scale * lo_smp
+    return float(scale), float(intercept)
+
+
 def cap_for_sift(img_u8, max_dim, interpolation=cv2.INTER_AREA):
     """
     Downsample img_u8 (if needed) so its larger side is at most max_dim.
@@ -1004,25 +1031,28 @@ for source_filepath in source_files:
     # bands) so plots are visually interpretable. Raw band values from
     # different sensors can have very different native ranges (e.g.
     # PlanetScope surface reflectance vs. NAIP 8-bit DN), so before display
-    # each target channel is rescaled onto the source's radiometric scale
-    # using the before-alignment RANSAC-inlier fit (source ~= scale*target +
-    # intercept, from compute_band_metrics_matched_resolution above) and the
-    # two are then jointly normalized — this is only a display transform and
-    # is never applied to the registered GeoTIFF output. Falls back to
-    # independent per-image normalization if the fit is unavailable (e.g.
-    # too few RANSAC inliers). Built here (rather than later, next to the
-    # plotting code) because src_clip / tgt_clip are freed before plotting
-    # to bound memory; capped immediately to a bounded resolution for the
-    # same reason.
+    # each target channel is linearly rescaled to match the source's own
+    # [display_percentile_clip, 100 - display_percentile_clip] value range
+    # (percentile_histogram_match) and the two are then jointly normalized —
+    # this is only a display transform and is never applied to the
+    # registered GeoTIFF output. A histogram match (rather than the
+    # RANSAC-inlier regression used for the alignment_metrics.csv scale/
+    # intercept columns) is used here deliberately: it needs no pixel-to-
+    # pixel correspondence between source and target, so — unlike that
+    # regression fit — it isn't biased by residual misregistration between
+    # the two rasters before alignment. Falls back to independent per-image
+    # normalization if either range is degenerate. Built here (rather than
+    # later, next to the plotting code) because src_clip / tgt_clip are
+    # freed before plotting to bound memory; capped immediately to a
+    # bounded resolution for the same reason.
     _src_display_channels, _tgt_display_channels = [], []
     for _b, _t in zip(display_bands, display_target_bands):
         _s_arr = src_clip.isel(band=_b).values.astype(np.float32)
         _t_arr = tgt_clip.isel(band=_t).values.astype(np.float32)
-        _b_scale = _metrics_before['scale_inliers'][_b]
-        _b_intercept = _metrics_before['intercept_inliers'][_b]
-        if np.isfinite(_b_scale) and np.isfinite(_b_intercept):
+        _t_scale, _t_intercept = percentile_histogram_match(_t_arr, _s_arr, display_percentile_clip)
+        if np.isfinite(_t_scale) and np.isfinite(_t_intercept):
             _s_norm, _t_norm = normalize_pair(
-                _s_arr, _b_scale * _t_arr + _b_intercept, percentile_clip=display_percentile_clip
+                _s_arr, _t_scale * _t_arr + _t_intercept, percentile_clip=display_percentile_clip
             )
         else:
             _s_norm = normalize_single(_s_arr, percentile_clip=display_percentile_clip)
