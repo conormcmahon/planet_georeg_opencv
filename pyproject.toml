@@ -1,0 +1,27 @@
+[project]
+name = "planet_georeg_opencv"
+version = "0.1.0"
+description = "OpenCV/SIFT-based image co-registration (sensor/CRS/resolution-agnostic)"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+    "opencv-contrib-python",
+    "GDAL",
+    "rasterio",
+    "rioxarray",
+    "xarray",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["planet_georeg_opencv*"]
