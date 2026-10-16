@@ -25,7 +25,7 @@ def get_matched_band_pairs(band_map: list[int]) -> list[tuple[int, int]]:
 def extract_band_arrays(image, band_indices: list[int]) -> dict[int, np.ndarray]:
     """Return {band_idx: float32 numpy array} for the given 0-indexed bands."""
     return {
-        idx: image.isel(band=idx).values.astype(np.float32)
+        idx: image.isel(band=idx).values.astype(np.float32, copy=False)
         for idx in band_indices
     }
 
@@ -39,6 +39,41 @@ def compute_nd_indices(band_arrays: dict[int, np.ndarray]) -> dict[tuple[int, in
     for a, b in combinations(keys, 2):
         out[(a, b)] = (band_arrays[a] - band_arrays[b]) / (band_arrays[a] + band_arrays[b] + eps)
     return out
+
+
+def iter_nd_index_pairs(band_arrays_a: dict[int, np.ndarray], band_arrays_b: dict[int, np.ndarray]):
+    """Yield (key, nd_a, nd_b) for every pair of bands shared by the two
+    dicts (same keys and ordering as compute_nd_indices), computing one
+    channel at a time so only one pair of ND arrays is held in memory --
+    for an 8-band image that's 2 arrays instead of 2 x 28."""
+    eps = 1e-6
+    for a, b in combinations(sorted(band_arrays_a), 2):
+        nd_a = (band_arrays_a[a] - band_arrays_a[b]) / (band_arrays_a[a] + band_arrays_a[b] + eps)
+        nd_b = (band_arrays_b[a] - band_arrays_b[b]) / (band_arrays_b[a] + band_arrays_b[b] + eps)
+        yield (a, b), nd_a, nd_b
+
+
+def iter_nd_indices(band_arrays: dict[int, np.ndarray]):
+    """Yield (key, nd) for every pair of bands in `band_arrays` -- the
+    single-image form of iter_nd_index_pairs (same keys, ordering and
+    values), one channel at a time."""
+    eps = 1e-6
+    for a, b in combinations(sorted(band_arrays), 2):
+        yield (a, b), (band_arrays[a] - band_arrays[b]) / (band_arrays[a] + band_arrays[b] + eps)
+
+
+def joint_range(arr1: np.ndarray, arr2: np.ndarray) -> tuple[float, float]:
+    """(min, max) over both arrays, ignoring NaN -- the range normalize_pair
+    uses by default."""
+    return min(np.nanmin(arr1), np.nanmin(arr2)), max(np.nanmax(arr1), np.nanmax(arr2))
+
+
+def normalize_to_range(arr: np.ndarray, lo: float, hi: float) -> np.ndarray:
+    """`arr` scaled so [lo, hi] -> [0, 1] (all zeros if the range is empty);
+    identical to one half of normalize_pair(..., percentile_clip=None)."""
+    if not (hi > lo):
+        return np.zeros_like(arr)
+    return (arr - lo) / (hi - lo)
 
 
 def normalize_pair(arr1: np.ndarray, arr2: np.ndarray, percentile_clip: float | None = None):
@@ -112,6 +147,8 @@ def percentile_histogram_match(sample_arr: np.ndarray, reference_arr: np.ndarray
 
 def to_uint8(arr: np.ndarray) -> np.ndarray:
     """Convert a float [0, 1] array to uint8 [0, 255], mapping NaN to 0."""
-    return np.nan_to_num(
-        np.round(np.clip(arr * 255, 0, 255)), nan=0.0
-    ).astype(np.uint8)
+    scaled = arr * 255  # the only full-size temporary; the rest is in place
+    np.clip(scaled, 0, 255, out=scaled)
+    np.round(scaled, out=scaled)
+    scaled[np.isnan(scaled)] = 0
+    return scaled.astype(np.uint8)

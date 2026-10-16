@@ -17,6 +17,12 @@ Public entry points:
                         (used to co-register two rasters with different grids
                         onto one common grid).
 
+    register_local_models - register_local for several warp models in one
+                        pass (matching done once, each model then applied).
+    detect_reference_keypoints - detect a reference image's keypoints once,
+                        to pass to register_local (`fixed_keypoints`) when
+                        many images are registered against that reference.
+
 Both return a `RegistrationResult` and never write to disk -- callers decide
 whether/where to save the registered raster (e.g. via
 `result.registered.rio.to_raster(path)`).
@@ -25,6 +31,10 @@ This library has no knowledge of any particular downstream pipeline (e.g.
 psnorm) -- it only knows about rasters, band maps, and pixels.
 """
 
-from .register import RegistrationResult, register_local, register_to_grid
+from .reference_keypoints import ReferenceKeypoints, detect_reference_keypoints
+from .register import RegistrationResult, register_local, register_local_models, register_to_grid
 
-__all__ = ["RegistrationResult", "register_local", "register_to_grid"]
+__all__ = [
+    "RegistrationResult", "register_local", "register_local_models", "register_to_grid",
+    "ReferenceKeypoints", "detect_reference_keypoints",
+]

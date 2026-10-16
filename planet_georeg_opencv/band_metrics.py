@@ -42,6 +42,34 @@ def ransac_linear_fit(x, y, threshold, rng, n_iterations=200, min_inliers=2):
     return float(slope), float(intercept), inlier_mask
 
 
+def sample_valid_pixels(valid: np.ndarray, max_points: int, rng):
+    """(rows, cols) of every True pixel of the 2D `valid` mask in row-major
+    order, or, if there are more than `max_points`, of a uniform random
+    sample of them -- the same sample as
+        flat = np.flatnonzero(valid); flat = flat[rng.choice(len(flat), max_points, replace=False)]
+    but without materializing an int64 index of every valid pixel (8 bytes
+    per pixel for a raster of tens of megapixels): sample positions are
+    mapped to pixels through per-row counts instead.
+    """
+    n = int(np.count_nonzero(valid))
+    if n <= max_points:
+        return np.nonzero(valid)
+    sel = rng.choice(n, max_points, replace=False)
+    row_counts = np.count_nonzero(valid, axis=1)
+    row_ends = np.cumsum(row_counts)
+    order = np.argsort(sel, kind="stable")
+    sel_sorted = sel[order]
+    rows_sorted = np.searchsorted(row_ends, sel_sorted, side="right")
+    within_row = sel_sorted - (row_ends[rows_sorted] - row_counts[rows_sorted])
+    cols_sorted = np.empty_like(sel_sorted)
+    breaks = np.flatnonzero(np.diff(rows_sorted)) + 1
+    for start, end in zip(np.r_[0, breaks], np.r_[breaks, len(sel_sorted)]):
+        cols_sorted[start:end] = np.flatnonzero(valid[rows_sorted[start]])[within_row[start:end]]
+    rows, cols = np.empty_like(rows_sorted), np.empty_like(cols_sorted)
+    rows[order], cols[order] = rows_sorted, cols_sorted
+    return rows, cols
+
+
 def compute_band_metrics_matched_resolution(
     moving_clip, fixed_clip, matched_pairs, rng,
     max_sample_points=200_000, ransac_iterations=200, ransac_threshold_frac=0.2,
@@ -119,11 +147,8 @@ def compute_band_metrics_matched_resolution(
     for moving_idx, fixed_idx in matched_pairs:
         fine_idx, coarse_idx = (moving_idx, fixed_idx) if moving_is_finer else (fixed_idx, moving_idx)
 
-        coarse_band = coarse_clip.isel(band=coarse_idx).values.astype(np.float32)
-        rows, cols = np.where(~np.isnan(coarse_band))
-        if len(rows) > max_sample_points:
-            sel = rng.choice(len(rows), max_sample_points, replace=False)
-            rows, cols = rows[sel], cols[sel]
+        coarse_band = coarse_clip.isel(band=coarse_idx).values.astype(np.float32, copy=False)
+        rows, cols = sample_valid_pixels(~np.isnan(coarse_band), max_sample_points, rng)
         if len(rows) < 2:
             _set_nan(moving_idx)
             continue
@@ -131,7 +156,7 @@ def compute_band_metrics_matched_resolution(
         world_x, world_y = coarse_transform * (cols.astype(np.float64), rows.astype(np.float64))
         fine_col, fine_row = inv_fine_transform * (world_x, world_y)
 
-        fine_band = fine_clip.isel(band=fine_idx).values.astype(np.float32)
+        fine_band = fine_clip.isel(band=fine_idx).values.astype(np.float32, copy=False)
         fine_nan = np.isnan(fine_band)
 
         if use_average:
@@ -178,7 +203,7 @@ def compute_band_metrics_matched_resolution(
 
         # --- RANSAC: robust moving ~= scale*fixed + intercept, with inlier stats ---
         threshold = ransac_threshold_frac * float(
-            np.nanstd(moving_clip.isel(band=moving_idx).values.astype(np.float32))
+            np.nanstd(moving_clip.isel(band=moving_idx).values.astype(np.float32, copy=False))
         )
         _, _, inlier_mask = ransac_linear_fit(f, m, threshold, rng, n_iterations=ransac_iterations)
         out['inlier_frac'][moving_idx] = float(inlier_mask.mean()) if len(inlier_mask) else np.nan
@@ -213,6 +238,12 @@ def build_metric_keys(matched_pairs):
                     keys.append(f"{stat}_band{moving_idx}_{when}_{subset}")
             keys.append(f"inlier_frac_band{moving_idx}_{when}")
     keys += ["mean_kp_dist_before", "mean_kp_dist_after", "avg_dx_px", "avg_dy_px"]
+    # The global affine transform fitted to the matched keypoints, in the
+    # moving image's own pixels (see tps_warp.describe_affine). It is the
+    # warp applied by warp_model="affine"; for "tps" it is the fit the
+    # control points were selected with.
+    from .tps_warp import AFFINE_METRIC_KEYS
+    keys += list(AFFINE_METRIC_KEYS)
     return keys
 
 
@@ -239,13 +270,25 @@ def write_alignment_metrics_csv(filepath, metric_keys, moving_filename, fixed_fi
     import os
 
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    header = (
+        "moving_filename,fixed_filename,"
+        "num_step1_ransac_inliers,num_step1_good_matches,num_step1_raw_matches,"
+        "num_ransac_inliers,num_good_matches,num_raw_matches,"
+        + ','.join(metric_keys)
+    )
     if not os.path.exists(filepath):
         with open(filepath, 'w') as f:
-            f.write(
-                "moving_filename,fixed_filename,"
-                "num_step1_ransac_inliers,num_step1_good_matches,num_step1_raw_matches,"
-                "num_ransac_inliers,num_good_matches,num_raw_matches,"
-                + ','.join(metric_keys) + '\n'
+            f.write(header + '\n')
+    else:
+        # Appending under a different header would silently misalign the
+        # new row's columns (e.g. a log started before a metric was added).
+        with open(filepath) as f:
+            existing_header = f.readline().rstrip('\n')
+        if existing_header != header:
+            raise ValueError(
+                f"'{filepath}' has different columns from the row being appended "
+                f"({len(existing_header.split(','))} against {len(header.split(','))}); "
+                f"write to a new file, or move the old one aside."
             )
     if metrics is None:
         metrics = {k: np.nan for k in metric_keys}
